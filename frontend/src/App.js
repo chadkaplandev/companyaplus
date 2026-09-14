@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { Calendar, Clock, MapPin, Users, Plus, ChevronLeft, ChevronRight, User, LogOut, X, Cake, Heart, Phone, Mail, Megaphone } from 'lucide-react';
 
-const API_URL = (typeof process !== 'undefined' && process.env && process.env.REACT_APP_API_URL) || 'http://localhost:5000/api';
+const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:5000/api';
 
 async function apiFetch(path, { method = 'GET', token, body } = {}) {
   const headers = { 'Content-Type': 'application/json' };
