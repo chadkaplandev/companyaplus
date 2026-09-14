@@ -1,5 +1,6 @@
 // npm run dev
 
+const crypto = require('crypto');
 require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
@@ -12,6 +13,10 @@ app.use(cors());
 app.use(express.json());
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
+const BREVO_API_KEY = process.env.BREVO_API_KEY;
+const BREVO_SENDER_EMAIL = process.env.BREVO_SENDER_EMAIL;
+const BREVO_SENDER_NAME = process.env.BREVO_SENDER_NAME || 'Event Manager';
 
 // ---------- DB Connection ----------
 mongoose.connect(process.env.MONGODB_URI)
@@ -26,7 +31,9 @@ const userSchema = new mongoose.Schema({
   phone: { type: String, default: '' },
   spouse: { type: String, default: '' },
   birthday: { type: String, default: '' }, // stored as 'YYYY-MM-DD'
-  role: { type: String, enum: ['admin', 'member'], default: 'member' }
+  role: { type: String, enum: ['admin', 'member'], default: 'member' },
+  resetTokenHash: { type: String, default: null },
+  resetTokenExpires: { type: Date, default: null }
 }, { timestamps: true });
 
 const eventSchema = new mongoose.Schema({
@@ -83,6 +90,40 @@ const requireAdmin = (req, res, next) => {
   next();
 };
 
+// ---------- Email Helper (Brevo) ----------
+const sendResetEmail = async (toEmail, toName, resetUrl) => {
+  if (!BREVO_API_KEY || !BREVO_SENDER_EMAIL) {
+    console.warn('Brevo not configured — skipping email send. Reset URL:', resetUrl);
+    return;
+  }
+
+  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      'api-key': BREVO_API_KEY,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
+    },
+    body: JSON.stringify({
+      sender: { name: BREVO_SENDER_NAME, email: BREVO_SENDER_EMAIL },
+      to: [{ email: toEmail, name: toName }],
+      subject: 'Reset your Event Manager password',
+      htmlContent: `
+        <p>Hi ${toName},</p>
+        <p>We received a request to reset your password. Click the link below to choose a new one. This link expires in 1 hour.</p>
+        <p><a href="${resetUrl}">${resetUrl}</a></p>
+        <p>If you didn't request this, you can safely ignore this email.</p>
+      `
+    })
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    console.error('Brevo send failed:', res.status, body);
+    throw new Error('Failed to send reset email');
+  }
+};
+
 // ---------- Auth Routes ----------
 
 // One-time bootstrap: creates the first admin account. Locks itself once an admin exists.
@@ -129,6 +170,59 @@ app.get('/api/auth/me', authenticate, async (req, res) => {
     const user = await User.findById(req.userId);
     if (!user) return res.status(404).json({ message: 'User not found' });
     res.json(sanitizeUser(user));
+  } catch (err) {
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
+});
+
+// Request a password reset email
+app.post('/api/auth/forgot-password', async (req, res) => {
+  const genericResponse = { message: 'If an account with that email exists, a reset link has been sent.' };
+  try {
+    const { email } = req.body;
+    const user = await User.findOne({ email: (email || '').toLowerCase().trim() });
+
+    if (!user) return res.json(genericResponse);
+
+    const rawToken = crypto.randomBytes(32).toString('hex');
+    const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+
+    user.resetTokenHash = tokenHash;
+    user.resetTokenExpires = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+    await user.save();
+
+    const resetUrl = `${FRONTEND_URL}/reset-password?token=${rawToken}`;
+    await sendResetEmail(user.email, user.name, resetUrl);
+
+    res.json(genericResponse);
+  } catch (err) {
+    console.error('forgot-password error:', err);
+    res.json(genericResponse);
+  }
+});
+
+// Complete a password reset using the emailed token
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { token, password } = req.body;
+    if (!token || !password || password.length < 6) {
+      return res.status(400).json({ message: 'A valid token and a password of at least 6 characters are required' });
+    }
+
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    const user = await User.findOne({
+      resetTokenHash: tokenHash,
+      resetTokenExpires: { $gt: new Date() }
+    });
+
+    if (!user) return res.status(400).json({ message: 'This reset link is invalid or has expired' });
+
+    user.password = await bcrypt.hash(password, 10);
+    user.resetTokenHash = null;
+    user.resetTokenExpires = null;
+    await user.save();
+
+    res.json({ message: 'Password updated successfully. You can now log in.' });
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
   }
