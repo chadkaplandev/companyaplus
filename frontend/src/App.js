@@ -1,10 +1,11 @@
 // npm start
 
 import React, { useState, useEffect, useCallback } from 'react';
-import { Calendar, Clock, MapPin, Users, Plus, ChevronLeft, ChevronRight, User, LogOut, X, Cake, Heart, Phone, Mail, Megaphone } from 'lucide-react';
+import { Calendar, Clock, MapPin, Users, Plus, ChevronLeft, ChevronRight, User, LogOut, X, Cake, Heart, Phone, Mail, Megaphone, Sun, Gift } from 'lucide-react';
 
 const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:5000/api';
 
+// ---------- API helper ----------
 async function apiFetch(path, { method = 'GET', token, body } = {}) {
   const headers = { 'Content-Type': 'application/json' };
   if (token) headers.Authorization = `Bearer ${token}`;
@@ -27,9 +28,95 @@ async function apiFetch(path, { method = 'GET', token, body } = {}) {
   return data;
 }
 
+// ---------- Helpers ----------
+// Mongo gives me _id, so I copy it to id to keep the rest of the code simple
 const normalizeUser = (u) => ({ ...u, id: u._id });
 const normalizeEvent = (e) => ({ ...e, id: e._id });
 const normalizeAnnouncement = (a) => ({ ...a, id: a._id });
+
+const fullName = (u) => (u ? [u.firstName, u.lastName].filter(Boolean).join(' ') : '');
+
+// sorting by last name first, then first name as the tiebreaker
+const byLastName = (a, b) =>
+  (a.lastName || '').localeCompare(b.lastName || '', undefined, { sensitivity: 'base' }) ||
+  (a.firstName || '').localeCompare(b.firstName || '', undefined, { sensitivity: 'base' });
+
+// datetime-local inputs need "YYYY-MM-DDTHH:mm" in the viewer's own timezone.
+// toISOString() gives UTC, which was shifting the time, so I subtract the offset first.
+const toLocalInputValue = (iso) => {
+  const d = new Date(iso);
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+};
+
+const formatMonthDay = (dateStr) =>
+  new Date(dateStr + 'T00:00:00').toLocaleDateString([], { month: 'short', day: 'numeric' });
+
+// shrinks the chosen photo to max 256px so it stays tiny in the database
+function resizeImageToDataUrl(file, maxSize = 256) {
+  return new Promise((resolve, reject) => {
+    if (!file.type.startsWith('image/')) return reject(new Error('Please choose an image file.'));
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Could not read that file.'));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('That image could not be loaded.'));
+      img.onload = () => {
+        const scale = Math.min(1, maxSize / Math.max(img.width, img.height));
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.round(img.width * scale);
+        canvas.height = Math.round(img.height * scale);
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ffffff'; // white behind transparent PNGs so they don't turn black
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL('image/jpeg', 0.8));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+const inputClass = 'w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none';
+
+function Field({ label, children }) {
+  return (
+    <div>
+      <label className="block text-sm font-medium text-gray-700 mb-1">{label}</label>
+      {children}
+    </div>
+  );
+}
+
+function Avatar({ user, size = 'md' }) {
+  const sizes = {
+    md: 'w-12 h-12 text-sm',
+    lg: 'w-16 h-16 text-lg',
+    xl: 'w-24 h-24 text-2xl'
+  };
+  const initials = `${(user.firstName || '?')[0]}${(user.lastName || '')[0] || ''}`.toUpperCase();
+
+  if (user.profilePicture) {
+    return <img src={user.profilePicture} alt={fullName(user)} className={`${sizes[size]} rounded-full object-cover flex-shrink-0`} />;
+  }
+  return (
+    <div className={`${sizes[size]} rounded-full bg-indigo-100 text-indigo-700 font-semibold flex items-center justify-center flex-shrink-0`}>
+      {initials}
+    </div>
+  );
+}
+
+function Detail({ icon: Icon, label, children }) {
+  return (
+    <div className="flex items-start gap-2">
+      <Icon className="w-4 h-4 mt-0.5 text-gray-400 flex-shrink-0" />
+      <span className="whitespace-pre-line break-words min-w-0">
+        {label && <span className="text-gray-400">{label}: </span>}
+        {children}
+      </span>
+    </div>
+  );
+}
 
 // ---------- Login ----------
 function Login({ onSubmit, onForgot }) {
@@ -70,7 +157,7 @@ function Login({ onSubmit, onForgot }) {
               onChange={(e) => setEmail(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && handleLogin()}
               placeholder="you@example.com"
-              className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none"
+              className={inputClass}
             />
           </div>
           <div>
@@ -84,7 +171,7 @@ function Login({ onSubmit, onForgot }) {
               onChange={(e) => setPassword(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && handleLogin()}
               placeholder="••••••••"
-              className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none"
+              className={inputClass}
             />
           </div>
           <button
@@ -149,7 +236,7 @@ function ForgotPassword({ onBack }) {
                 onChange={(e) => setEmail(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && submit()}
                 placeholder="you@example.com"
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none"
+                className={inputClass}
               />
             </div>
             <button
@@ -213,14 +300,12 @@ function ResetPassword({ token, onDone }) {
             {error && <div className="bg-red-50 text-red-600 p-3 rounded-lg text-sm">{error}</div>}
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">New Password</label>
-              <input type="password" value={password} onChange={(e) => setPassword(e.target.value)}
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none" />
+              <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} className={inputClass} />
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Confirm Password</label>
               <input type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && submit()}
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none" />
+                onKeyDown={(e) => e.key === 'Enter' && submit()} className={inputClass} />
             </div>
             <button
               onClick={submit}
@@ -237,20 +322,26 @@ function ResetPassword({ token, onDone }) {
 }
 
 // ---------- Event Modal ----------
-function EventModal({ event, isAdmin, currentUser, users = [], saving, error, onClose, onSave, onDelete, onRsvp }) {
+function EventModal({ event, isAdmin, currentUser, saving, error, onClose, onSave, onDelete, onRsvp }) {
   const isNew = !event;
   const [fd, setFd] = useState({
     title: event?.title || '',
     description: event?.description || '',
-    date: event?.date ? new Date(event.date).toISOString().slice(0, 16) : '',
+    date: event?.date ? toLocalInputValue(event.date) : '',
     location: event?.location || ''
   });
   const [editing, setEditing] = useState(isNew);
 
   const myRsvp = event?.rsvps?.[currentUser.id];
   const rsvpCounts = event ? Object.values(event.rsvps).reduce((acc, v) => { acc[v] = (acc[v] || 0) + 1; return acc; }, {}) : {};
-  const usersById = Object.fromEntries(users.map(u => [u.id, u.name]));
   const canSubmit = fd.title.trim() && fd.date;
+
+  // names come from the server with each event, so members can see them too
+  const namesFor = (status) =>
+    Object.entries(event.rsvps)
+      .filter(([, s]) => s === status)
+      .map(([uid]) => (event.rsvpNames && event.rsvpNames[uid]) || 'A member')
+      .sort((a, b) => a.localeCompare(b));
 
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50" onClick={onClose}>
@@ -267,26 +358,18 @@ function EventModal({ event, isAdmin, currentUser, users = [], saving, error, on
 
           {editing ? (
             <div className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Title</label>
-                <input type="text" value={fd.title} onChange={(e) => setFd({ ...fd, title: e.target.value })}
-                  className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none" />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Date & Time</label>
-                <input type="datetime-local" value={fd.date} onChange={(e) => setFd({ ...fd, date: e.target.value })}
-                  className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none" />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Location</label>
-                <input type="text" value={fd.location} onChange={(e) => setFd({ ...fd, location: e.target.value })}
-                  className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none" />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Description</label>
-                <textarea value={fd.description} onChange={(e) => setFd({ ...fd, description: e.target.value })}
-                  className="w-full px-4 py-2 border border-gray-300 rounded-lg h-24 focus:ring-2 focus:ring-indigo-500 outline-none" />
-              </div>
+              <Field label="Title">
+                <input type="text" value={fd.title} onChange={(e) => setFd({ ...fd, title: e.target.value })} className={inputClass} />
+              </Field>
+              <Field label="Date & Time">
+                <input type="datetime-local" value={fd.date} onChange={(e) => setFd({ ...fd, date: e.target.value })} className={inputClass} />
+              </Field>
+              <Field label="Location">
+                <input type="text" value={fd.location} onChange={(e) => setFd({ ...fd, location: e.target.value })} className={inputClass} />
+              </Field>
+              <Field label="Description">
+                <textarea value={fd.description} onChange={(e) => setFd({ ...fd, description: e.target.value })} className={`${inputClass} h-24`} />
+              </Field>
               <div className="flex gap-3 pt-2">
                 <button
                   disabled={!canSubmit || saving}
@@ -343,9 +426,7 @@ function EventModal({ event, isAdmin, currentUser, users = [], saving, error, on
                 </h4>
                 <div className="space-y-2 mt-3">
                   {['yes', 'maybe', 'no'].map(status => {
-                    const names = Object.entries(event.rsvps)
-                      .filter(([, s]) => s === status)
-                      .map(([uid]) => usersById[uid] || (uid === currentUser.id ? currentUser.name : 'A member'));
+                    const names = namesFor(status);
                     if (names.length === 0) return null;
                     return (
                       <div key={status}>
@@ -387,21 +468,45 @@ function MemberModal({ member, currentUser, saving, error, onClose, onSave, onDe
   const isNew = !member;
   const isSelf = !isNew && currentUser && member.id === currentUser.id;
   const roleLocked = isSelf && member.role === 'admin';
+  const [photoError, setPhotoError] = useState('');
   const [fd, setFd] = useState({
-    name: member?.name || '',
+    firstName: member?.firstName || '',
+    lastName: member?.lastName || '',
     email: member?.email || '',
     password: '',
-    phone: member?.phone || '',
+    profilePicture: member?.profilePicture || '',
     spouse: member?.spouse || '',
     birthday: member?.birthday || '',
+    anniversary: member?.anniversary || '',
+    address: member?.address || '',
+    summerAddress: member?.summerAddress || '',
+    phoneCell: member?.phoneCell || '',
+    phoneHome: member?.phoneHome || '',
+    phoneSummer: member?.phoneSummer || '',
     role: member?.role || 'member'
   });
 
-  const canSubmit = fd.name.trim() && fd.email.trim() && (!isNew || fd.password.trim().length >= 6);
+  const set = (key) => (e) => setFd({ ...fd, [key]: e.target.value });
+
+  const canSubmit =
+    fd.firstName.trim() && fd.lastName.trim() && fd.email.trim() && (!isNew || fd.password.trim().length >= 6);
+
+  const handlePhoto = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = ''; // so picking the same file twice still triggers onChange
+    if (!file) return;
+    setPhotoError('');
+    try {
+      const dataUrl = await resizeImageToDataUrl(file);
+      setFd((prev) => ({ ...prev, profilePicture: dataUrl }));
+    } catch (err) {
+      setPhotoError(err.message);
+    }
+  };
 
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50" onClick={onClose}>
-      <div className="bg-white rounded-lg max-w-lg w-full max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+      <div className="bg-white rounded-lg max-w-xl w-full max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
         <div className="p-6">
           <div className="flex justify-between items-center mb-6">
             <h2 className="text-xl font-bold text-gray-800">{isNew ? 'Add Member' : 'Edit Member'}</h2>
@@ -411,48 +516,85 @@ function MemberModal({ member, currentUser, saving, error, onClose, onSave, onDe
           {error && <div className="bg-red-50 text-red-600 p-3 rounded-lg text-sm mb-4">{error}</div>}
 
           <div className="space-y-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Name</label>
-              <input type="text" value={fd.name} onChange={(e) => setFd({ ...fd, name: e.target.value })}
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none" />
+            <div className="flex items-center gap-4">
+              <Avatar user={{ firstName: fd.firstName, lastName: fd.lastName, profilePicture: fd.profilePicture }} size="xl" />
+              <div>
+                <label htmlFor="photo-upload" className="inline-block px-3 py-2 border border-gray-300 rounded-lg text-sm cursor-pointer hover:bg-gray-50">
+                  {fd.profilePicture ? 'Change photo' : 'Upload photo'}
+                </label>
+                <input id="photo-upload" type="file" accept="image/*" onChange={handlePhoto} className="hidden" />
+                {fd.profilePicture && (
+                  <button onClick={() => setFd({ ...fd, profilePicture: '' })} className="ml-3 text-sm text-red-600 hover:underline">
+                    Remove
+                  </button>
+                )}
+                {photoError && <p className="text-xs text-red-600 mt-1">{photoError}</p>}
+                <p className="text-xs text-gray-400 mt-1">Photos are resized automatically.</p>
+              </div>
             </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Email</label>
-              <input type="email" value={fd.email} onChange={(e) => setFd({ ...fd, email: e.target.value })}
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none" />
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <Field label="First Name">
+                <input type="text" value={fd.firstName} onChange={set('firstName')} className={inputClass} />
+              </Field>
+              <Field label="Last Name">
+                <input type="text" value={fd.lastName} onChange={set('lastName')} className={inputClass} />
+              </Field>
             </div>
+
+            <Field label="Spouse / Significant Other">
+              <input type="text" value={fd.spouse} onChange={set('spouse')} className={inputClass} />
+            </Field>
+
+            <Field label="Email">
+              <input type="email" value={fd.email} onChange={set('email')} className={inputClass} />
+            </Field>
+
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">
                 {isNew ? 'Temporary Password' : 'Reset Password'}
                 {!isNew && <span className="text-gray-400 font-normal"> (leave blank to keep current)</span>}
               </label>
-              <input type="password" value={fd.password} onChange={(e) => setFd({ ...fd, password: e.target.value })}
-                placeholder={isNew ? 'Min. 6 characters' : '••••••••'}
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none" />
-              {isNew && <p className="text-xs text-gray-400 mt-1">Share this with the member directly — they'll use it to log in.</p>}
+              <input type="password" value={fd.password} onChange={set('password')}
+                placeholder={isNew ? 'Min. 6 characters' : '••••••••'} className={inputClass} />
+              {isNew && <p className="text-xs text-gray-400 mt-1">Share this with the member directly. They'll use it to log in.</p>}
             </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Phone</label>
-              <input type="tel" value={fd.phone} onChange={(e) => setFd({ ...fd, phone: e.target.value })}
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none" />
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <Field label="Birthday">
+                <input type="date" value={fd.birthday} onChange={set('birthday')} className={inputClass} />
+              </Field>
+              <Field label="Anniversary">
+                <input type="date" value={fd.anniversary} onChange={set('anniversary')} className={inputClass} />
+              </Field>
             </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Spouse</label>
-              <input type="text" value={fd.spouse} onChange={(e) => setFd({ ...fd, spouse: e.target.value })}
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none" />
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <Field label="Cell Phone">
+                <input type="tel" value={fd.phoneCell} onChange={set('phoneCell')} className={inputClass} />
+              </Field>
+              <Field label="Home Phone">
+                <input type="tel" value={fd.phoneHome} onChange={set('phoneHome')} className={inputClass} />
+              </Field>
+              <Field label="Summer Phone">
+                <input type="tel" value={fd.phoneSummer} onChange={set('phoneSummer')} className={inputClass} />
+              </Field>
             </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Birthday</label>
-              <input type="date" value={fd.birthday} onChange={(e) => setFd({ ...fd, birthday: e.target.value })}
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none" />
-            </div>
+
+            <Field label="Address">
+              <textarea value={fd.address} onChange={set('address')} className={`${inputClass} h-20`} />
+            </Field>
+            <Field label="Summer Address">
+              <textarea value={fd.summerAddress} onChange={set('summerAddress')} className={`${inputClass} h-20`} />
+            </Field>
+
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Role</label>
               <select
                 value={fd.role}
                 disabled={roleLocked}
-                onChange={(e) => setFd({ ...fd, role: e.target.value })}
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none disabled:bg-gray-100 disabled:text-gray-400"
+                onChange={set('role')}
+                className={`${inputClass} disabled:bg-gray-100 disabled:text-gray-400`}
               >
                 <option value="member">Member</option>
                 <option value="admin">Admin</option>
@@ -465,11 +607,12 @@ function MemberModal({ member, currentUser, saving, error, onClose, onSave, onDe
               {!roleLocked && !isNew && fd.role !== member.role && (
                 <p className="text-xs text-amber-600 mt-1">
                   {fd.role === 'admin'
-                    ? `Saving will give ${member.name} full admin access, including managing members.`
-                    : `Saving will remove ${member.name}'s admin access.`}
+                    ? `Saving will give ${fullName(member)} full admin access, including managing members.`
+                    : `Saving will remove ${fullName(member)}'s admin access.`}
                 </p>
               )}
             </div>
+
             <div className="flex gap-3 pt-2">
               <button
                 disabled={!canSubmit || saving}
@@ -518,16 +661,12 @@ function AnnouncementModal({ announcement, saving, error, onClose, onSave, onDel
           {error && <div className="bg-red-50 text-red-600 p-3 rounded-lg text-sm mb-4">{error}</div>}
 
           <div className="space-y-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Title</label>
-              <input type="text" value={fd.title} onChange={(e) => setFd({ ...fd, title: e.target.value })}
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none" />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Message</label>
-              <textarea value={fd.body} onChange={(e) => setFd({ ...fd, body: e.target.value })}
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg h-32 focus:ring-2 focus:ring-indigo-500 outline-none" />
-            </div>
+            <Field label="Title">
+              <input type="text" value={fd.title} onChange={(e) => setFd({ ...fd, title: e.target.value })} className={inputClass} />
+            </Field>
+            <Field label="Message">
+              <textarea value={fd.body} onChange={(e) => setFd({ ...fd, body: e.target.value })} className={`${inputClass} h-32`} />
+            </Field>
             <div className="flex gap-3 pt-2">
               <button
                 disabled={!canSubmit || saving}
@@ -666,6 +805,7 @@ function Dashboard({ currentUser, token, onLogout }) {
 
   const changeMonth = (delta) => setViewDate(new Date(viewDate.getFullYear(), viewDate.getMonth() + delta, 1));
 
+  // ----- events -----
   const openEvent = (evt) => { setSelectedEvent(evt); setModalError(''); setShowEventModal(true); };
   const openNewEvent = () => { setSelectedEvent(null); setModalError(''); setShowEventModal(true); };
   const closeEventModal = () => { setShowEventModal(false); setSelectedEvent(null); setModalError(''); };
@@ -674,7 +814,14 @@ function Dashboard({ currentUser, token, onLogout }) {
     setSaving(true);
     setModalError('');
     try {
-      const body = { title: data.title, description: data.description, date: data.date, location: data.location };
+      const body = {
+        title: data.title,
+        description: data.description,
+        // the input gives me local time with no timezone, so I turn it into a real UTC timestamp here.
+        // this is the line that fixes the "4 hours early" bug
+        date: new Date(data.date).toISOString(),
+        location: data.location
+      };
       if (data.id) {
         await apiFetch(`/events/${data.id}`, { method: 'PUT', token, body });
       } else {
@@ -718,6 +865,7 @@ function Dashboard({ currentUser, token, onLogout }) {
     }
   };
 
+  // ----- members -----
   const openMember = (m) => { setSelectedMember(m); setModalError(''); setShowMemberModal(true); };
   const openNewMember = () => { setSelectedMember(null); setModalError(''); setShowMemberModal(true); };
   const closeMemberModal = () => { setShowMemberModal(false); setSelectedMember(null); setModalError(''); };
@@ -726,7 +874,21 @@ function Dashboard({ currentUser, token, onLogout }) {
     setSaving(true);
     setModalError('');
     try {
-      const body = { name: data.name, email: data.email, phone: data.phone, spouse: data.spouse, birthday: data.birthday, role: data.role };
+      const body = {
+        firstName: data.firstName,
+        lastName: data.lastName,
+        email: data.email,
+        profilePicture: data.profilePicture,
+        spouse: data.spouse,
+        birthday: data.birthday,
+        anniversary: data.anniversary,
+        address: data.address,
+        summerAddress: data.summerAddress,
+        phoneCell: data.phoneCell,
+        phoneHome: data.phoneHome,
+        phoneSummer: data.phoneSummer,
+        role: data.role
+      };
       if (data.password) body.password = data.password;
 
       if (data.id) {
@@ -758,6 +920,7 @@ function Dashboard({ currentUser, token, onLogout }) {
     }
   };
 
+  // ----- announcements -----
   const openAnnouncement = (a) => { setSelectedAnnouncement(a); setModalError(''); setShowAnnouncementModal(true); };
   const openNewAnnouncement = () => { setSelectedAnnouncement(null); setModalError(''); setShowAnnouncementModal(true); };
   const closeAnnouncementModal = () => { setShowAnnouncementModal(false); setSelectedAnnouncement(null); setModalError(''); };
@@ -807,7 +970,7 @@ function Dashboard({ currentUser, token, onLogout }) {
           <div className="flex items-center space-x-4">
             <div className="hidden sm:flex items-center space-x-2 text-gray-700 text-sm">
               <User className="w-4 h-4" />
-              <span className="font-medium">{currentUser.name}</span>
+              <span className="font-medium">{fullName(currentUser)}</span>
               <span className="text-gray-400">({currentUser.role})</span>
             </div>
             <button onClick={onLogout} className="flex items-center space-x-1 px-3 py-2 text-gray-600 hover:bg-gray-100 rounded-lg text-sm">
@@ -882,7 +1045,7 @@ function Dashboard({ currentUser, token, onLogout }) {
                       <div>
                         <h3 className="font-semibold text-gray-800">{a.title}</h3>
                         <p className="text-xs text-gray-400 mt-0.5">
-                          {a.createdBy?.name ? `Posted by ${a.createdBy.name}` : 'Posted'} · {new Date(a.createdAt).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' })}
+                          {a.createdBy ? `Posted by ${fullName(a.createdBy)}` : 'Posted'} · {new Date(a.createdAt).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' })}
                         </p>
                       </div>
                       {isAdmin && (
@@ -902,47 +1065,45 @@ function Dashboard({ currentUser, token, onLogout }) {
         {tab === 'members' && isAdmin && (
           <div className="bg-white rounded-xl shadow-sm p-6">
             <div className="flex justify-between items-center mb-6">
-              <h2 className="text-lg font-semibold text-gray-800">Members</h2>
+              <h2 className="text-lg font-semibold text-gray-800">
+                Members <span className="text-gray-400 font-normal text-sm">({users.length})</span>
+              </h2>
               <button onClick={openNewMember} className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 text-sm font-medium">
                 <Plus className="w-4 h-4" /> Add Member
               </button>
             </div>
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="text-left text-gray-500 border-b">
-                    <th className="py-2 pr-4 font-medium">Name</th>
-                    <th className="py-2 pr-4 font-medium">Contact</th>
-                    <th className="py-2 pr-4 font-medium">Spouse</th>
-                    <th className="py-2 pr-4 font-medium">Birthday</th>
-                    <th className="py-2 pr-4 font-medium">Role</th>
-                    <th className="py-2"></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {users.map(u => (
-                    <tr key={u.id} className="border-b last:border-0 hover:bg-gray-50">
-                      <td className="py-3 pr-4 font-medium text-gray-800">{u.name}</td>
-                      <td className="py-3 pr-4 text-gray-600">
-                        <div className="flex items-center gap-1"><Mail className="w-3 h-3" />{u.email}</div>
-                        {u.phone && <div className="flex items-center gap-1 mt-0.5"><Phone className="w-3 h-3" />{u.phone}</div>}
-                      </td>
-                      <td className="py-3 pr-4 text-gray-600">
-                        {u.spouse ? <div className="flex items-center gap-1"><Heart className="w-3 h-3" />{u.spouse}</div> : '—'}
-                      </td>
-                      <td className="py-3 pr-4 text-gray-600">
-                        {u.birthday ? <div className="flex items-center gap-1"><Cake className="w-3 h-3" />{new Date(u.birthday + 'T00:00:00').toLocaleDateString([], { month: 'short', day: 'numeric' })}</div> : '—'}
-                      </td>
-                      <td className="py-3 pr-4">
-                        <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${u.role === 'admin' ? 'bg-indigo-100 text-indigo-700' : 'bg-gray-100 text-gray-700'}`}>{u.role}</span>
-                      </td>
-                      <td className="py-3 text-right">
-                        <button onClick={() => openMember(u)} className="text-indigo-600 hover:text-indigo-800 font-medium">Edit</button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              {[...users].sort(byLastName).map(u => (
+                <div key={u.id} className="border border-gray-200 rounded-xl p-4 flex gap-4">
+                  <Avatar user={u} size="lg" />
+                  <div className="flex-1 min-w-0">
+                    <div className="flex justify-between items-start gap-2">
+                      <div className="min-w-0">
+                        <h3 className="font-semibold text-gray-800 truncate">{fullName(u)}</h3>
+                        <span className={`inline-block mt-0.5 px-2 py-0.5 rounded-full text-xs font-medium ${u.role === 'admin' ? 'bg-indigo-100 text-indigo-700' : 'bg-gray-100 text-gray-700'}`}>
+                          {u.role}
+                        </span>
+                      </div>
+                      <button onClick={() => openMember(u)} className="text-indigo-600 hover:text-indigo-800 text-sm font-medium flex-shrink-0">
+                        Edit
+                      </button>
+                    </div>
+
+                    <div className="mt-3 space-y-1 text-sm text-gray-600">
+                      {u.spouse && <Detail icon={Heart} label="Spouse/SO">{u.spouse}</Detail>}
+                      <Detail icon={Mail}>{u.email}</Detail>
+                      {u.phoneCell && <Detail icon={Phone} label="Cell">{u.phoneCell}</Detail>}
+                      {u.phoneHome && <Detail icon={Phone} label="Home">{u.phoneHome}</Detail>}
+                      {u.phoneSummer && <Detail icon={Phone} label="Summer">{u.phoneSummer}</Detail>}
+                      {u.birthday && <Detail icon={Cake} label="Birthday">{formatMonthDay(u.birthday)}</Detail>}
+                      {u.anniversary && <Detail icon={Gift} label="Anniversary">{formatMonthDay(u.anniversary)}</Detail>}
+                      {u.address && <Detail icon={MapPin} label="Address">{u.address}</Detail>}
+                      {u.summerAddress && <Detail icon={Sun} label="Summer address">{u.summerAddress}</Detail>}
+                    </div>
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
         )}
@@ -953,7 +1114,6 @@ function Dashboard({ currentUser, token, onLogout }) {
           event={selectedEvent}
           isAdmin={isAdmin}
           currentUser={currentUser}
-          users={users}
           saving={saving}
           error={modalError}
           onClose={closeEventModal}
@@ -991,7 +1151,7 @@ function Dashboard({ currentUser, token, onLogout }) {
 
 // ---------- App ----------
 export default function App() {
-  const [view, setView] = useState('login');
+  const [view, setView] = useState('login'); // 'login' | 'forgot' | 'reset' | 'app'
   const [resetToken, setResetToken] = useState(null);
   const [token, setToken] = useState(null);
   const [currentUser, setCurrentUser] = useState(null);

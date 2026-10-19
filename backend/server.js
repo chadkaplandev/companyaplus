@@ -1,36 +1,40 @@
 // npm run dev
 
-const crypto = require('crypto');
 require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+// profile pictures come in as small base64 strings, so I raised the body limit from the default
+app.use(express.json({ limit: '1mb' }));
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
+// stripping trailing slashes so the reset link never turns into "//reset-password"
+const FRONTEND_URL = (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/+$/, '');
 const BREVO_API_KEY = process.env.BREVO_API_KEY;
 const BREVO_SENDER_EMAIL = process.env.BREVO_SENDER_EMAIL;
 const BREVO_SENDER_NAME = process.env.BREVO_SENDER_NAME || 'Event Manager';
 
-// ---------- DB Connection ----------
-mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('Connected to MongoDB'))
-  .catch(err => console.error('MongoDB connection error:', err));
-
 // ---------- Schemas ----------
 const userSchema = new mongoose.Schema({
-  name: { type: String, required: true },
+  firstName: { type: String, required: true, trim: true },
+  lastName: { type: String, default: '', trim: true },
   email: { type: String, required: true, unique: true, lowercase: true, trim: true },
   password: { type: String, required: true },
-  phone: { type: String, default: '' },
-  spouse: { type: String, default: '' },
-  birthday: { type: String, default: '' }, // stored as 'YYYY-MM-DD'
+  profilePicture: { type: String, default: '' }, // small resized image stored as a base64 data URL
+  spouse: { type: String, default: '' },         // spouse or significant other
+  birthday: { type: String, default: '' },       // 'YYYY-MM-DD'
+  anniversary: { type: String, default: '' },    // 'YYYY-MM-DD'
+  address: { type: String, default: '' },
+  summerAddress: { type: String, default: '' },
+  phoneCell: { type: String, default: '' },
+  phoneHome: { type: String, default: '' },
+  phoneSummer: { type: String, default: '' },
   role: { type: String, enum: ['admin', 'member'], default: 'member' },
   resetTokenHash: { type: String, default: null },
   resetTokenExpires: { type: Date, default: null }
@@ -52,24 +56,101 @@ const announcementSchema = new mongoose.Schema({
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
 }, { timestamps: true });
 
-const Announcement = mongoose.model('Announcement', announcementSchema);
-
 const User = mongoose.model('User', userSchema);
 const Event = mongoose.model('Event', eventSchema);
+const Announcement = mongoose.model('Announcement', announcementSchema);
 
 // ---------- Helpers ----------
 const sanitizeUser = (userDoc) => {
-  const u = userDoc.toObject ? userDoc.toObject() : userDoc;
+  const u = userDoc.toObject ? userDoc.toObject() : { ...userDoc };
   delete u.password;
+  delete u.resetTokenHash;
+  delete u.resetTokenExpires;
   return u;
 };
 
-const sanitizeEvent = (eventDoc) => {
+// the simple text fields that every member has, so I don't repeat them in each route
+const PROFILE_FIELDS = ['spouse', 'birthday', 'anniversary', 'address', 'summerAddress', 'phoneCell', 'phoneHome', 'phoneSummer'];
+const pickProfileFields = (body) => {
+  const out = {};
+  PROFILE_FIELDS.forEach((f) => {
+    if (body[f] !== undefined) out[f] = typeof body[f] === 'string' ? body[f].trim() : '';
+  });
+  return out;
+};
+
+// returns '' for no picture, the string if it's a valid small image, or null if it's invalid
+const cleanPicture = (pic) => {
+  if (!pic) return '';
+  if (typeof pic !== 'string' || !pic.startsWith('data:image/') || pic.length > 300000) return null;
+  return pic;
+};
+
+// looks up the names of everyone who RSVP'd so members can see them without needing the full member list
+const loadNamesFor = async (eventDocs) => {
+  const ids = new Set();
+  eventDocs.forEach((ev) => ev.rsvps.forEach((_, uid) => ids.add(uid)));
+  const validIds = [...ids].filter((id) => mongoose.isValidObjectId(id));
+  const people = await User.find({ _id: { $in: validIds } }).select('firstName lastName');
+  const map = {};
+  people.forEach((p) => {
+    map[p._id.toString()] = [p.firstName, p.lastName].filter(Boolean).join(' ');
+  });
+  return map;
+};
+
+const sanitizeEvent = (eventDoc, namesById = {}) => {
   const e = eventDoc.toObject ? eventDoc.toObject() : eventDoc;
-  // Convert Mongoose Map to plain object for JSON responses
   e.rsvps = e.rsvps instanceof Map ? Object.fromEntries(e.rsvps) : (e.rsvps || {});
+  e.rsvpNames = {};
+  Object.keys(e.rsvps).forEach((uid) => {
+    e.rsvpNames[uid] = namesById[uid] || 'Former member';
+  });
   return e;
 };
+
+const eventToJson = async (eventDoc) => sanitizeEvent(eventDoc, await loadNamesFor([eventDoc]));
+
+// ---------- One-time migration for accounts made before the new fields ----------
+const migrateOldFields = async () => {
+  const oldDocs = await User.collection.find({
+    $or: [
+      { firstName: { $exists: false } },
+      { phone: { $exists: true }, phoneCell: { $exists: false } }
+    ]
+  }).toArray();
+
+  for (const doc of oldDocs) {
+    const set = {};
+    if (doc.firstName === undefined) {
+      // splitting the old single "name" on spaces, last word becomes the last name
+      const parts = (doc.name || '').trim().split(/\s+/).filter(Boolean);
+      const last = parts.length > 1 ? parts.pop() : '';
+      set.firstName = parts.join(' ');
+      set.lastName = last;
+    }
+    if (doc.phoneCell === undefined && doc.phone !== undefined) {
+      set.phoneCell = doc.phone;
+    }
+    if (Object.keys(set).length) {
+      // leaving the old name/phone fields alone on purpose, just in case
+      await User.collection.updateOne({ _id: doc._id }, { $set: set });
+    }
+  }
+  if (oldDocs.length) console.log(`Migrated ${oldDocs.length} older member record(s)`);
+};
+
+// ---------- DB Connection ----------
+mongoose.connect(process.env.MONGODB_URI)
+  .then(async () => {
+    console.log('Connected to MongoDB');
+    try {
+      await migrateOldFields();
+    } catch (err) {
+      console.error('Migration problem:', err);
+    }
+  })
+  .catch((err) => console.error('MongoDB connection error:', err));
 
 // ---------- Auth Middleware ----------
 const authenticate = (req, res, next) => {
@@ -93,7 +174,7 @@ const requireAdmin = (req, res, next) => {
 // ---------- Email Helper (Brevo) ----------
 const sendResetEmail = async (toEmail, toName, resetUrl) => {
   if (!BREVO_API_KEY || !BREVO_SENDER_EMAIL) {
-    console.warn('Brevo not configured — skipping email send. Reset URL:', resetUrl);
+    console.warn('Brevo not configured, skipping email send. Reset URL:', resetUrl);
     return;
   }
 
@@ -126,7 +207,7 @@ const sendResetEmail = async (toEmail, toName, resetUrl) => {
 
 // ---------- Auth Routes ----------
 
-// One-time bootstrap: creates the first admin account. Locks itself once an admin exists.
+// One-time bootstrap for the very first admin. Disables itself once an admin exists.
 app.post('/api/setup/admin', async (req, res) => {
   try {
     const existingAdmin = await User.findOne({ role: 'admin' });
@@ -134,14 +215,13 @@ app.post('/api/setup/admin', async (req, res) => {
       return res.status(400).json({ message: 'An admin account already exists. This setup route is now disabled.' });
     }
 
-    const { name, email, password } = req.body;
-    if (!name || !email || !password) {
-      return res.status(400).json({ message: 'name, email, and password are required' });
+    const { firstName, lastName, email, password } = req.body;
+    if (!firstName || !lastName || !email || !password) {
+      return res.status(400).json({ message: 'firstName, lastName, email, and password are required' });
     }
 
     const hashed = await bcrypt.hash(password, 10);
-    const admin = await User.create({ name, email, password: hashed, role: 'admin' });
-
+    const admin = await User.create({ firstName, lastName, email, password: hashed, role: 'admin' });
     res.status(201).json({ message: 'Admin account created', user: sanitizeUser(admin) });
   } catch (err) {
     if (err.code === 11000) return res.status(400).json({ message: 'Email already in use' });
@@ -175,13 +255,11 @@ app.get('/api/auth/me', authenticate, async (req, res) => {
   }
 });
 
-// Request a password reset email
 app.post('/api/auth/forgot-password', async (req, res) => {
   const genericResponse = { message: 'If an account with that email exists, a reset link has been sent.' };
   try {
     const { email } = req.body;
     const user = await User.findOne({ email: (email || '').toLowerCase().trim() });
-
     if (!user) return res.json(genericResponse);
 
     const rawToken = crypto.randomBytes(32).toString('hex');
@@ -192,7 +270,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     await user.save();
 
     const resetUrl = `${FRONTEND_URL}/reset-password?token=${rawToken}`;
-    await sendResetEmail(user.email, user.name, resetUrl);
+    await sendResetEmail(user.email, user.firstName, resetUrl);
 
     res.json(genericResponse);
   } catch (err) {
@@ -201,7 +279,6 @@ app.post('/api/auth/forgot-password', async (req, res) => {
   }
 });
 
-// Complete a password reset using the emailed token
 app.post('/api/auth/reset-password', async (req, res) => {
   try {
     const { token, password } = req.body;
@@ -214,7 +291,6 @@ app.post('/api/auth/reset-password', async (req, res) => {
       resetTokenHash: tokenHash,
       resetTokenExpires: { $gt: new Date() }
     });
-
     if (!user) return res.status(400).json({ message: 'This reset link is invalid or has expired' });
 
     user.password = await bcrypt.hash(password, 10);
@@ -228,11 +304,10 @@ app.post('/api/auth/reset-password', async (req, res) => {
   }
 });
 
-// ---------- User (Member) Routes — Admin only ----------
-
+// ---------- Member Routes (admin only) ----------
 app.get('/api/users', authenticate, requireAdmin, async (req, res) => {
   try {
-    const users = await User.find().sort({ name: 1 });
+    const users = await User.find().sort({ lastName: 1, firstName: 1 });
     res.json(users.map(sanitizeUser));
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
@@ -241,14 +316,22 @@ app.get('/api/users', authenticate, requireAdmin, async (req, res) => {
 
 app.post('/api/users', authenticate, requireAdmin, async (req, res) => {
   try {
-    const { name, email, password, phone, spouse, birthday, role } = req.body;
-    if (!name || !email || !password) {
-      return res.status(400).json({ message: 'name, email, and password are required' });
+    const { firstName, lastName, email, password, role, profilePicture } = req.body;
+    if (!firstName || !lastName || !email || !password) {
+      return res.status(400).json({ message: 'First name, last name, email, and password are required' });
     }
+
+    const picture = cleanPicture(profilePicture);
+    if (picture === null) return res.status(400).json({ message: 'Profile picture must be a small image file' });
 
     const hashed = await bcrypt.hash(password, 10);
     const user = await User.create({
-      name, email, password: hashed, phone, spouse, birthday,
+      firstName,
+      lastName,
+      email,
+      password: hashed,
+      profilePicture: picture,
+      ...pickProfileFields(req.body),
       role: role === 'admin' ? 'admin' : 'member'
     });
 
@@ -261,12 +344,25 @@ app.post('/api/users', authenticate, requireAdmin, async (req, res) => {
 
 app.put('/api/users/:id', authenticate, requireAdmin, async (req, res) => {
   try {
-    const { name, email, password, phone, spouse, birthday, role } = req.body;
-    const update = { name, email, phone, spouse, birthday, role: role === 'admin' ? 'admin' : 'member' };
-
-    if (password) {
-      update.password = await bcrypt.hash(password, 10);
+    const { firstName, lastName, email, password, role, profilePicture } = req.body;
+    if (!firstName || !lastName || !email) {
+      return res.status(400).json({ message: 'First name, last name, and email are required' });
     }
+
+    const newRole = role === 'admin' ? 'admin' : 'member';
+    // same safeguard as the frontend: admins can't demote themselves
+    if (req.params.id === req.userId && newRole !== 'admin') {
+      return res.status(400).json({ message: "You can't remove your own admin access" });
+    }
+
+    const update = { firstName, lastName, email, role: newRole, ...pickProfileFields(req.body) };
+
+    if (profilePicture !== undefined) {
+      const picture = cleanPicture(profilePicture);
+      if (picture === null) return res.status(400).json({ message: 'Profile picture must be a small image file' });
+      update.profilePicture = picture;
+    }
+    if (password) update.password = await bcrypt.hash(password, 10);
 
     const user = await User.findByIdAndUpdate(req.params.id, update, { new: true, runValidators: true });
     if (!user) return res.status(404).json({ message: 'User not found' });
@@ -292,12 +388,11 @@ app.delete('/api/users/:id', authenticate, requireAdmin, async (req, res) => {
 });
 
 // ---------- Event Routes ----------
-
-// All authenticated users (admin + member) can view events
 app.get('/api/events', authenticate, async (req, res) => {
   try {
     const events = await Event.find().sort({ date: 1 });
-    res.json(events.map(sanitizeEvent));
+    const names = await loadNamesFor(events);
+    res.json(events.map((e) => sanitizeEvent(e, names)));
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
   }
@@ -307,20 +402,19 @@ app.get('/api/events/:id', authenticate, async (req, res) => {
   try {
     const event = await Event.findById(req.params.id);
     if (!event) return res.status(404).json({ message: 'Event not found' });
-    res.json(sanitizeEvent(event));
+    res.json(await eventToJson(event));
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
   }
 });
 
-// Admin only: create, update, delete
 app.post('/api/events', authenticate, requireAdmin, async (req, res) => {
   try {
     const { title, description, date, location } = req.body;
     if (!title || !date) return res.status(400).json({ message: 'title and date are required' });
 
     const event = await Event.create({ title, description, date, location, createdBy: req.userId });
-    res.status(201).json(sanitizeEvent(event));
+    res.status(201).json(await eventToJson(event));
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
   }
@@ -335,7 +429,7 @@ app.put('/api/events/:id', authenticate, requireAdmin, async (req, res) => {
       { new: true, runValidators: true }
     );
     if (!event) return res.status(404).json({ message: 'Event not found' });
-    res.json(sanitizeEvent(event));
+    res.json(await eventToJson(event));
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
   }
@@ -351,7 +445,7 @@ app.delete('/api/events/:id', authenticate, requireAdmin, async (req, res) => {
   }
 });
 
-// RSVP — any authenticated user sets their own status on an event
+// any logged-in user sets their own RSVP
 app.post('/api/events/:id/rsvp', authenticate, async (req, res) => {
   try {
     const { status } = req.body;
@@ -365,31 +459,28 @@ app.post('/api/events/:id/rsvp', authenticate, async (req, res) => {
     event.rsvps.set(req.userId, status);
     await event.save();
 
-    res.json(sanitizeEvent(event));
+    res.json(await eventToJson(event));
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
   }
 });
 
 // ---------- Announcement Routes ----------
-
-// Anyone logged in (admin or member) can read announcements
 app.get('/api/announcements', authenticate, async (req, res) => {
   try {
-    const announcements = await Announcement.find().sort({ createdAt: -1 }).populate('createdBy', 'name');
+    const announcements = await Announcement.find().sort({ createdAt: -1 }).populate('createdBy', 'firstName lastName');
     res.json(announcements);
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
   }
 });
 
-// Admin only: create, update, delete
 app.post('/api/announcements', authenticate, requireAdmin, async (req, res) => {
   try {
     const { title, body } = req.body;
     if (!title || !body) return res.status(400).json({ message: 'title and body are required' });
     const announcement = await Announcement.create({ title, body, createdBy: req.userId });
-    await announcement.populate('createdBy', 'name');
+    await announcement.populate('createdBy', 'firstName lastName');
     res.status(201).json(announcement);
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
@@ -403,7 +494,7 @@ app.put('/api/announcements/:id', authenticate, requireAdmin, async (req, res) =
       req.params.id,
       { title, body },
       { new: true, runValidators: true }
-    ).populate('createdBy', 'name');
+    ).populate('createdBy', 'firstName lastName');
     if (!announcement) return res.status(404).json({ message: 'Announcement not found' });
     res.json(announcement);
   } catch (err) {
@@ -421,7 +512,7 @@ app.delete('/api/announcements/:id', authenticate, requireAdmin, async (req, res
   }
 });
 
-// ---------- Health check (useful for Render/uptime pings) ----------
+// ---------- Health check ----------
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
 // ---------- Start Server ----------
