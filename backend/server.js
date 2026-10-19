@@ -305,7 +305,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
 });
 
 // ---------- Member Routes (admin only) ----------
-app.get('/api/users', authenticate, requireAdmin, async (req, res) => {
+app.get('/api/users', authenticate, async (req, res) => {
   try {
     const users = await User.find().sort({ lastName: 1, firstName: 1 });
     res.json(users.map(sanitizeUser));

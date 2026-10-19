@@ -407,11 +407,10 @@ function EventModal({ event, isAdmin, currentUser, saving, error, onClose, onSav
                       key={status}
                       disabled={saving}
                       onClick={() => onRsvp(event.id, status)}
-                      className={`flex-1 py-2 rounded-lg font-medium capitalize transition-colors disabled:opacity-60 ${
-                        myRsvp === status
+                      className={`flex-1 py-2 rounded-lg font-medium capitalize transition-colors disabled:opacity-60 ${myRsvp === status
                           ? status === 'yes' ? 'bg-green-600 text-white' : status === 'no' ? 'bg-red-600 text-white' : 'bg-yellow-500 text-white'
                           : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                      }`}
+                        }`}
                     >
                       {status}
                     </button>
@@ -430,9 +429,8 @@ function EventModal({ event, isAdmin, currentUser, saving, error, onClose, onSav
                     if (names.length === 0) return null;
                     return (
                       <div key={status}>
-                        <p className={`text-xs font-semibold uppercase tracking-wide ${
-                          status === 'yes' ? 'text-green-600' : status === 'no' ? 'text-red-600' : 'text-yellow-600'
-                        }`}>
+                        <p className={`text-xs font-semibold uppercase tracking-wide ${status === 'yes' ? 'text-green-600' : status === 'no' ? 'text-red-600' : 'text-yellow-600'
+                          }`}>
                           {status} ({names.length})
                         </p>
                         <p className="text-sm text-gray-700">{names.join(', ')}</p>
@@ -781,7 +779,6 @@ function Dashboard({ currentUser, token, onLogout }) {
   }, [token]);
 
   const loadUsers = useCallback(async () => {
-    if (!isAdmin) return;
     try {
       const data = await apiFetch('/users', { token });
       setUsers(data.map(normalizeUser));
@@ -789,7 +786,7 @@ function Dashboard({ currentUser, token, onLogout }) {
     } catch (err) {
       setLoadError(err.message);
     }
-  }, [token, isAdmin]);
+  }, [token]);
 
   const loadAnnouncements = useCallback(async () => {
     try {
@@ -995,11 +992,9 @@ function Dashboard({ currentUser, token, onLogout }) {
           <button onClick={() => setTab('announcements')} className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${tab === 'announcements' ? 'bg-indigo-600 text-white' : 'bg-white text-gray-700 hover:bg-gray-100'}`}>
             Announcements
           </button>
-          {isAdmin && (
-            <button onClick={() => setTab('members')} className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${tab === 'members' ? 'bg-indigo-600 text-white' : 'bg-white text-gray-700 hover:bg-gray-100'}`}>
-              Members
-            </button>
-          )}
+          <button onClick={() => setTab('members')} className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${tab === 'members' ? 'bg-indigo-600 text-white' : 'bg-white text-gray-700 hover:bg-gray-100'}`}>
+            Members
+          </button>
         </div>
 
         {tab === 'calendar' && (
@@ -1062,15 +1057,17 @@ function Dashboard({ currentUser, token, onLogout }) {
           </div>
         )}
 
-        {tab === 'members' && isAdmin && (
+        {tab === 'members' && (
           <div className="bg-white rounded-xl shadow-sm p-6">
             <div className="flex justify-between items-center mb-6">
               <h2 className="text-lg font-semibold text-gray-800">
                 Members <span className="text-gray-400 font-normal text-sm">({users.length})</span>
               </h2>
-              <button onClick={openNewMember} className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 text-sm font-medium">
-                <Plus className="w-4 h-4" /> Add Member
-              </button>
+              {isAdmin && (
+                <button onClick={openNewMember} className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 text-sm font-medium">
+                  <Plus className="w-4 h-4" /> Add Member
+                </button>
+              )}
             </div>
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -1085,9 +1082,11 @@ function Dashboard({ currentUser, token, onLogout }) {
                           {u.role}
                         </span>
                       </div>
-                      <button onClick={() => openMember(u)} className="text-indigo-600 hover:text-indigo-800 text-sm font-medium flex-shrink-0">
-                        Edit
-                      </button>
+                      {isAdmin && (
+                        <button onClick={() => openMember(u)} className="text-indigo-600 hover:text-indigo-800 text-sm font-medium flex-shrink-0">
+                          Edit
+                        </button>
+                      )}
                     </div>
 
                     <div className="mt-3 space-y-1 text-sm text-gray-600">
