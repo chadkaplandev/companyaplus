@@ -305,6 +305,76 @@ app.post('/api/auth/reset-password', async (req, res) => {
 });
 
 // ---------- Member Routes (admin only) ----------
+// ---------- Bulk import (admin only) ----------
+app.post('/api/users/import', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const { members } = req.body;
+    if (!Array.isArray(members) || members.length === 0) {
+      return res.status(400).json({ message: 'There are no members to import' });
+    }
+    if (members.length > 300) {
+      return res.status(400).json({ message: 'Please import 300 members or fewer at a time' });
+    }
+
+    // grabbing the emails that already exist so I can skip them instead of failing the whole import
+    const emails = members.map((m) => String((m && m.email) || '').toLowerCase().trim()).filter(Boolean);
+    const existing = await User.find({ email: { $in: emails } }).select('email');
+    const existingEmails = new Set(existing.map((u) => u.email));
+    const seenInFile = new Set();
+
+    let created = 0;
+    const skipped = [];
+    const failed = [];
+
+    for (let i = 0; i < members.length; i++) {
+      const m = members[i] || {};
+      const row = i + 1;
+      const firstName = String(m.firstName || '').trim();
+      const lastName = String(m.lastName || '').trim();
+      const email = String(m.email || '').toLowerCase().trim();
+      const who = email || `${firstName} ${lastName}`.trim() || '(blank row)';
+
+      if (!firstName || !lastName || !email) {
+        failed.push({ row, who, reason: 'Missing a first name, last name, or email' });
+        continue;
+      }
+      if (!/^\S+@\S+\.\S+$/.test(email)) {
+        failed.push({ row, who, reason: 'That email does not look valid' });
+        continue;
+      }
+      if (existingEmails.has(email)) {
+        skipped.push({ row, who, reason: 'Already a member' });
+        continue;
+      }
+      if (seenInFile.has(email)) {
+        skipped.push({ row, who, reason: 'Listed more than once in the file' });
+        continue;
+      }
+      seenInFile.add(email);
+
+      try {
+        // random password that nobody knows, members pick their own with "Forgot password?".
+        // it's 128 random bits so I use a cheap bcrypt cost to keep a big import fast
+        const hashed = await bcrypt.hash(crypto.randomBytes(16).toString('hex'), 4);
+        await User.create({
+          firstName,
+          lastName,
+          email,
+          password: hashed,
+          role: 'member',
+          ...pickProfileFields(m)
+        });
+        created++;
+      } catch (err) {
+        failed.push({ row, who, reason: err.message });
+      }
+    }
+
+    res.json({ created, skipped, failed });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
+});
 app.get('/api/users', authenticate, async (req, res) => {
   try {
     const users = await User.find().sort({ lastName: 1, firstName: 1 });

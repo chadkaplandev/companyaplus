@@ -1,7 +1,8 @@
 // npm start
 
 import React, { useState, useEffect, useCallback } from 'react';
-import { Calendar, Clock, MapPin, Users, Plus, ChevronLeft, ChevronRight, User, LogOut, X, Cake, Heart, Phone, Mail, Megaphone, Sun, Gift } from 'lucide-react';
+import { Calendar, Clock, MapPin, Users, Plus, ChevronLeft, ChevronRight, User, LogOut, X, Cake, Heart, Phone, Mail, Megaphone, Sun, Gift, Upload } from 'lucide-react';
+import Papa from 'papaparse';
 
 const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:5000/api';
 
@@ -41,6 +42,84 @@ const byLastName = (a, b) =>
   (a.lastName || '').localeCompare(b.lastName || '', undefined, { sensitivity: 'base' }) ||
   (a.firstName || '').localeCompare(b.firstName || '', undefined, { sensitivity: 'base' });
 
+// the fields I can import into, plus keywords to guess which spreadsheet column matches.
+// the order matters: more specific fields go first so "Summer Address" doesn't get grabbed as "Address"
+const IMPORT_FIELDS = [
+  { key: 'firstName', label: 'First Name', hints: ['first name', 'first'] },
+  { key: 'lastName', label: 'Last Name', hints: ['last name', 'surname', 'last'] },
+  { key: 'spouse', label: 'Spouse / Significant Other', hints: ['spouse', 'significant', 'partner'] },
+  { key: 'email', label: 'Email', hints: ['email', 'e-mail'] },
+  { key: 'anniversary', label: 'Anniversary', hints: ['anniversary'] },
+  { key: 'birthday', label: 'Birthday', hints: ['birthday', 'birth', 'dob'] },
+  { key: 'summerAddress', label: 'Summer Address', hints: ['summer address', 'summer home', 'seasonal address'] },
+  { key: 'address', label: 'Address', hints: ['address'] },
+  { key: 'phoneSummer', label: 'Summer Phone', hints: ['summer phone', 'summer number', 'summer'] },
+  { key: 'phoneHome', label: 'Home Phone', hints: ['home phone', 'home number', 'home'] },
+  { key: 'phoneCell', label: 'Cell Phone', hints: ['cell', 'mobile', 'phone'] },
+  { key: 'fullName', label: 'Full Name (only if there are no first/last columns)', hints: ['full name', 'name'] }
+];
+
+// each spreadsheet column can only be used once, so I track which ones are already taken
+const guessMapping = (headers) => {
+  const mapping = {};
+  const used = new Set();
+  IMPORT_FIELDS.forEach((f) => {
+    if (f.key === 'fullName' && mapping.firstName && mapping.lastName) return;
+    const match = headers.find((h) => !used.has(h) && f.hints.some((hint) => h.toLowerCase().includes(hint)));
+    if (match) {
+      mapping[f.key] = match;
+      used.add(match);
+    }
+  });
+  return mapping;
+};
+
+// turns what people typed into the form into YYYY-MM-DD, or '' if I can't read it
+const toIsoDate = (value) => {
+  const v = (value || '').trim();
+  if (!v) return '';
+  const pad = (n) => String(n).padStart(2, '0');
+  if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
+  const full = v.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (full) return `${full[3]}-${pad(full[1])}-${pad(full[2])}`;
+  // no year given (like "4/26"), so I use 2000 as a placeholder since only month and day get shown
+  const short = v.match(/^(\d{1,2})\/(\d{1,2})$/);
+  if (short) return `2000-${pad(short[1])}-${pad(short[2])}`;
+  const d = new Date(v);
+  if (!isNaN(d.getTime())) return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  return '';
+};
+
+// last word becomes the last name, everything before it is the first name
+const splitName = (full) => {
+  const parts = (full || '').trim().split(/\s+/).filter(Boolean);
+  const last = parts.length > 1 ? parts.pop() : '';
+  return { firstName: parts.join(' '), lastName: last };
+};
+
+const buildMembers = (rows, mapping) =>
+  rows.map((row) => {
+    const get = (key) => (mapping[key] ? String(row[mapping[key]] || '').trim() : '');
+    const names = mapping.firstName || mapping.lastName
+      ? { firstName: get('firstName'), lastName: get('lastName') }
+      : splitName(get('fullName'));
+    const birthday = toIsoDate(get('birthday'));
+    const anniversary = toIsoDate(get('anniversary'));
+    return {
+      ...names,
+      email: get('email'),
+      spouse: get('spouse'),
+      birthday,
+      anniversary,
+      address: get('address'),
+      summerAddress: get('summerAddress'),
+      phoneCell: get('phoneCell'),
+      phoneHome: get('phoneHome'),
+      phoneSummer: get('phoneSummer'),
+      // flagging dates I couldn't read so the preview can warn about them
+      badDate: Boolean((get('birthday') && !birthday) || (get('anniversary') && !anniversary))
+    };
+  });
 // datetime-local inputs need "YYYY-MM-DDTHH:mm" in the viewer's own timezone.
 // toISOString() gives UTC, which was shifting the time, so I subtract the offset first.
 const toLocalInputValue = (iso) => {
@@ -144,7 +223,7 @@ function Login({ onSubmit, onForgot }) {
           <div className="inline-block p-3 bg-indigo-100 rounded-full mb-4">
             <Calendar className="w-8 h-8 text-indigo-600" />
           </div>
-          <h1 className="text-3xl font-bold text-gray-800">Event Manager</h1>
+          <h1 className="text-3xl font-bold text-gray-800">Company A+</h1>
           <p className="text-gray-600 mt-2">Sign in to continue</p>
         </div>
         <div className="space-y-4">
@@ -408,8 +487,8 @@ function EventModal({ event, isAdmin, currentUser, saving, error, onClose, onSav
                       disabled={saving}
                       onClick={() => onRsvp(event.id, status)}
                       className={`flex-1 py-2 rounded-lg font-medium capitalize transition-colors disabled:opacity-60 ${myRsvp === status
-                          ? status === 'yes' ? 'bg-green-600 text-white' : status === 'no' ? 'bg-red-600 text-white' : 'bg-yellow-500 text-white'
-                          : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                        ? status === 'yes' ? 'bg-green-600 text-white' : status === 'no' ? 'bg-red-600 text-white' : 'bg-yellow-500 text-white'
+                        : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
                         }`}
                     >
                       {status}
@@ -691,6 +770,172 @@ function AnnouncementModal({ announcement, saving, error, onClose, onSave, onDel
 }
 
 // ---------- Calendar ----------
+// ---------- Import Modal ----------
+function ImportModal({ onClose, onImport }) {
+  const [stage, setStage] = useState('pick'); // 'pick' | 'review' | 'done'
+  const [headers, setHeaders] = useState([]);
+  const [rows, setRows] = useState([]);
+  const [mapping, setMapping] = useState({});
+  const [error, setError] = useState('');
+  const [importing, setImporting] = useState(false);
+  const [result, setResult] = useState(null);
+
+  const handleFile = (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = ''; // so choosing the same file again still works
+    if (!file) return;
+    setError('');
+    Papa.parse(file, {
+      header: true,
+      skipEmptyLines: true,
+      transformHeader: (h) => h.trim(),
+      complete: (res) => {
+        const found = res.meta.fields || [];
+        if (found.length === 0 || res.data.length === 0) {
+          setError('That file looks empty. Make sure it is the CSV downloaded from your Google Sheet.');
+          return;
+        }
+        setHeaders(found);
+        setRows(res.data);
+        setMapping(guessMapping(found));
+        setStage('review');
+      },
+      error: () => setError('Could not read that file.')
+    });
+  };
+
+  const members = buildMembers(rows, mapping);
+  const readyCount = members.filter((m) => m.firstName && m.lastName && m.email).length;
+  const badDateCount = members.filter((m) => m.badDate).length;
+
+  const runImport = async () => {
+    setImporting(true);
+    setError('');
+    try {
+      setResult(await onImport(members));
+      setStage('done');
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50" onClick={onClose}>
+      <div className="bg-white rounded-lg max-w-2xl w-full max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+        <div className="p-6">
+          <div className="flex justify-between items-center mb-6">
+            <h2 className="text-xl font-bold text-gray-800">Import Members from CSV</h2>
+            <button onClick={onClose} className="text-gray-400 hover:text-gray-600"><X className="w-5 h-5" /></button>
+          </div>
+
+          {error && <div className="bg-red-50 text-red-600 p-3 rounded-lg text-sm mb-4">{error}</div>}
+
+          {stage === 'pick' && (
+            <div className="space-y-4">
+              <p className="text-sm text-gray-600">
+                Choose the CSV you downloaded from your Google Form's response sheet. Nothing is saved until you
+                review it on the next screen. Members who are already in the app (matched by email) are skipped.
+              </p>
+              <label htmlFor="csv-upload" className="inline-block px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium cursor-pointer hover:bg-indigo-700">
+                Choose CSV file
+              </label>
+              <input id="csv-upload" type="file" accept=".csv,text/csv" onChange={handleFile} className="hidden" />
+            </div>
+          )}
+
+          {stage === 'review' && (
+            <div className="space-y-4">
+              <p className="text-sm text-gray-600">
+                I matched your spreadsheet columns to the member fields. Check them over and fix any that are wrong.
+              </p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {IMPORT_FIELDS.map((f) => (
+                  <Field key={f.key} label={f.label}>
+                    <select
+                      value={mapping[f.key] || ''}
+                      onChange={(e) => setMapping({ ...mapping, [f.key]: e.target.value })}
+                      className={inputClass}
+                    >
+                      <option value="">(skip)</option>
+                      {headers.map((h) => <option key={h} value={h}>{h}</option>)}
+                    </select>
+                  </Field>
+                ))}
+              </div>
+
+              <div className="border-t pt-4 space-y-2">
+                <p className="text-sm font-medium text-gray-800">
+                  {readyCount} of {members.length} rows are ready to import.
+                </p>
+                {members.length - readyCount > 0 && (
+                  <p className="text-xs text-amber-600">
+                    {members.length - readyCount} row(s) are missing a first name, last name, or email and will be reported as failed.
+                  </p>
+                )}
+                {badDateCount > 0 && (
+                  <p className="text-xs text-amber-600">
+                    {badDateCount} row(s) have a birthday or anniversary I couldn't read. Those dates will be left blank.
+                  </p>
+                )}
+                <div className="text-xs text-gray-500 space-y-0.5">
+                  {members.slice(0, 3).map((m, i) => (
+                    <div key={i}>{m.firstName} {m.lastName} · {m.email || 'no email'}{m.birthday ? ` · born ${m.birthday}` : ''}</div>
+                  ))}
+                  {members.length > 3 && <div>…and {members.length - 3} more</div>}
+                </div>
+              </div>
+
+              <div className="flex gap-3 pt-2">
+                <button
+                  disabled={readyCount === 0 || importing}
+                  onClick={runImport}
+                  className="flex-1 bg-indigo-600 text-white py-2 rounded-lg hover:bg-indigo-700 font-medium disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  {importing ? 'Importing…' : `Import ${readyCount} member${readyCount === 1 ? '' : 's'}`}
+                </button>
+                <button onClick={onClose} disabled={importing} className="px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50">
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+
+          {stage === 'done' && result && (
+            <div className="space-y-4">
+              <div className="bg-green-50 text-green-700 p-3 rounded-lg text-sm">
+                Imported {result.created} member{result.created === 1 ? '' : 's'}.
+              </div>
+              {result.skipped.length > 0 && (
+                <div>
+                  <p className="text-sm font-medium text-gray-700">Skipped ({result.skipped.length})</p>
+                  <ul className="text-sm text-gray-600 list-disc pl-5 max-h-32 overflow-y-auto">
+                    {result.skipped.map((s, i) => <li key={i}>Row {s.row} ({s.who}): {s.reason}</li>)}
+                  </ul>
+                </div>
+              )}
+              {result.failed.length > 0 && (
+                <div>
+                  <p className="text-sm font-medium text-red-600">Failed ({result.failed.length})</p>
+                  <ul className="text-sm text-gray-600 list-disc pl-5 max-h-32 overflow-y-auto">
+                    {result.failed.map((f, i) => <li key={i}>Row {f.row} ({f.who}): {f.reason}</li>)}
+                  </ul>
+                </div>
+              )}
+              <p className="text-sm text-gray-600">
+                Everyone imported has a random password. Tell them to open the site, click "Forgot password?", and set their own.
+              </p>
+              <button onClick={onClose} className="w-full bg-indigo-600 text-white py-2 rounded-lg hover:bg-indigo-700 font-medium">
+                Done
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
 function MonthCalendar({ viewDate, events, onEventClick }) {
   const year = viewDate.getFullYear();
   const month = viewDate.getMonth();
@@ -762,6 +1007,7 @@ function Dashboard({ currentUser, token, onLogout }) {
   const [selectedAnnouncement, setSelectedAnnouncement] = useState(null);
   const [modalError, setModalError] = useState('');
   const [saving, setSaving] = useState(false);
+  const [showImportModal, setShowImportModal] = useState(false);
 
   const isAdmin = currentUser.role === 'admin';
 
@@ -901,7 +1147,11 @@ function Dashboard({ currentUser, token, onLogout }) {
       setSaving(false);
     }
   };
-
+  const importMembers = async (members) => {
+    const data = await apiFetch('/users/import', { method: 'POST', token, body: { members } });
+    await loadUsers();
+    return data;
+  };
   const deleteMember = async (id) => {
     if (!window.confirm('Delete this member? This cannot be undone.')) return;
     setSaving(true);
@@ -1064,9 +1314,14 @@ function Dashboard({ currentUser, token, onLogout }) {
                 Members <span className="text-gray-400 font-normal text-sm">({users.length})</span>
               </h2>
               {isAdmin && (
-                <button onClick={openNewMember} className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 text-sm font-medium">
-                  <Plus className="w-4 h-4" /> Add Member
-                </button>
+                <div className="flex gap-2">
+                  <button onClick={() => setShowImportModal(true)} className="flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 text-sm font-medium">
+                    <Upload className="w-4 h-4" /> Import CSV
+                  </button>
+                  <button onClick={openNewMember} className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 text-sm font-medium">
+                    <Plus className="w-4 h-4" /> Add Member
+                  </button>
+                </div>
               )}
             </div>
 
@@ -1143,6 +1398,9 @@ function Dashboard({ currentUser, token, onLogout }) {
           onSave={saveAnnouncement}
           onDelete={deleteAnnouncement}
         />
+      )}
+            {showImportModal && (
+        <ImportModal onClose={() => setShowImportModal(false)} onImport={importMembers} />
       )}
     </div>
   );
