@@ -56,9 +56,23 @@ const announcementSchema = new mongoose.Schema({
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
 }, { timestamps: true });
 
+// files live in their own collection so the announcement list stays small and fast
+const attachmentSchema = new mongoose.Schema({
+  announcement: { type: mongoose.Schema.Types.ObjectId, ref: 'Announcement', required: true, index: true },
+  filename: { type: String, required: true },
+  contentType: { type: String, required: true },
+  size: { type: Number, required: true },
+  data: { type: Buffer, required: true }
+}, { timestamps: true });
+
 const User = mongoose.model('User', userSchema);
 const Event = mongoose.model('Event', eventSchema);
 const Announcement = mongoose.model('Announcement', announcementSchema);
+const Attachment = mongoose.model('Attachment', attachmentSchema);
+
+const ALLOWED_ATTACHMENT_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'application/pdf'];
+const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024; // 5 MB per file
+const MAX_ATTACHMENTS_PER_ANNOUNCEMENT = 5;
 
 // ---------- Helpers ----------
 const sanitizeUser = (userDoc) => {
@@ -110,6 +124,28 @@ const sanitizeEvent = (eventDoc, namesById = {}) => {
 };
 
 const eventToJson = async (eventDoc) => sanitizeEvent(eventDoc, await loadNamesFor([eventDoc]));
+
+// tacks a list of file info (never the file data itself) onto each announcement
+const withAttachments = async (announcements) => {
+  const ids = announcements.map((a) => a._id);
+  const files = await Attachment.find({ announcement: { $in: ids } })
+    .select('announcement filename contentType size')
+    .sort({ createdAt: 1 });
+
+  const byAnnouncement = {};
+  files.forEach((f) => {
+    const key = f.announcement.toString();
+    (byAnnouncement[key] = byAnnouncement[key] || []).push({
+      _id: f._id, filename: f.filename, contentType: f.contentType, size: f.size
+    });
+  });
+
+  return announcements.map((a) => {
+    const obj = a.toObject ? a.toObject() : a;
+    obj.attachments = byAnnouncement[a._id.toString()] || [];
+    return obj;
+  });
+};
 
 // ---------- One-time migration for accounts made before the new fields ----------
 const migrateOldFields = async () => {
@@ -304,7 +340,6 @@ app.post('/api/auth/reset-password', async (req, res) => {
   }
 });
 
-// ---------- Member Routes (admin only) ----------
 // ---------- Bulk import (admin only) ----------
 app.post('/api/users/import', authenticate, requireAdmin, async (req, res) => {
   try {
@@ -375,6 +410,9 @@ app.post('/api/users/import', authenticate, requireAdmin, async (req, res) => {
     res.status(500).json({ message: 'Server error', error: err.message });
   }
 });
+
+// ---------- Member Routes ----------
+// everyone logged in can read the member list, only admins can change it
 app.get('/api/users', authenticate, async (req, res) => {
   try {
     const users = await User.find().sort({ lastName: 1, firstName: 1 });
@@ -539,7 +577,7 @@ app.post('/api/events/:id/rsvp', authenticate, async (req, res) => {
 app.get('/api/announcements', authenticate, async (req, res) => {
   try {
     const announcements = await Announcement.find().sort({ createdAt: -1 }).populate('createdBy', 'firstName lastName');
-    res.json(announcements);
+    res.json(await withAttachments(announcements));
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
   }
@@ -576,7 +614,83 @@ app.delete('/api/announcements/:id', authenticate, requireAdmin, async (req, res
   try {
     const announcement = await Announcement.findByIdAndDelete(req.params.id);
     if (!announcement) return res.status(404).json({ message: 'Announcement not found' });
+    await Attachment.deleteMany({ announcement: announcement._id }); // cleaning up its files too
     res.json({ message: 'Announcement deleted' });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
+});
+
+// ---------- Attachment Routes ----------
+
+// upload one file (the browser sends the raw file as the request body)
+app.post(
+  '/api/announcements/:id/attachments',
+  authenticate,
+  requireAdmin,
+  express.raw({ type: ALLOWED_ATTACHMENT_TYPES, limit: MAX_ATTACHMENT_BYTES }),
+  async (req, res) => {
+    try {
+      const contentType = (req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+      if (!ALLOWED_ATTACHMENT_TYPES.includes(contentType)) {
+        return res.status(400).json({ message: 'Only images (JPG, PNG, GIF, WEBP) and PDFs can be attached' });
+      }
+      if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+        return res.status(400).json({ message: 'That file was empty' });
+      }
+
+      const announcement = await Announcement.findById(req.params.id);
+      if (!announcement) return res.status(404).json({ message: 'Announcement not found' });
+
+      const count = await Attachment.countDocuments({ announcement: announcement._id });
+      if (count >= MAX_ATTACHMENTS_PER_ANNOUNCEMENT) {
+        return res.status(400).json({ message: `An announcement can have up to ${MAX_ATTACHMENTS_PER_ANNOUNCEMENT} attachments` });
+      }
+
+      // cleaning up the filename so odd characters can't cause trouble later
+      let filename = 'attachment';
+      try { filename = decodeURIComponent(req.headers['x-filename'] || '') || filename; } catch (e) { /* keep the default */ }
+      filename = filename.replace(/[\\/\r\n"]/g, '_').slice(0, 150);
+
+      const file = await Attachment.create({
+        announcement: announcement._id,
+        filename,
+        contentType,
+        size: req.body.length,
+        data: req.body
+      });
+
+      res.status(201).json({ _id: file._id, filename: file.filename, contentType: file.contentType, size: file.size });
+    } catch (err) {
+      res.status(500).json({ message: 'Server error', error: err.message });
+    }
+  }
+);
+
+// download a file (any logged-in user)
+app.get('/api/attachments/:id', authenticate, async (req, res) => {
+  try {
+    const file = await Attachment.findById(req.params.id);
+    if (!file) return res.status(404).json({ message: 'Attachment not found' });
+
+    res.set({
+      'Content-Type': file.contentType,
+      'Content-Disposition': 'inline',
+      'X-Content-Type-Options': 'nosniff',
+      'Cache-Control': 'private, max-age=3600'
+    });
+    res.send(file.data);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
+});
+
+// remove one file from an announcement
+app.delete('/api/announcements/:id/attachments/:attachmentId', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const file = await Attachment.findOneAndDelete({ _id: req.params.attachmentId, announcement: req.params.id });
+    if (!file) return res.status(404).json({ message: 'Attachment not found' });
+    res.json({ message: 'Attachment removed' });
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
   }
@@ -584,6 +698,15 @@ app.delete('/api/announcements/:id', authenticate, requireAdmin, async (req, res
 
 // ---------- Health check ----------
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
+
+// ---------- Error handler (keeps errors as JSON so the frontend can show them) ----------
+app.use((err, req, res, next) => {
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({ message: 'That file is too large' });
+  }
+  console.error(err);
+  res.status(err.status || 500).json({ message: err.message || 'Server error' });
+});
 
 // ---------- Start Server ----------
 const PORT = process.env.PORT || 5000;

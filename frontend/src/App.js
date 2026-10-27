@@ -1,7 +1,7 @@
 // npm start
 
 import React, { useState, useEffect, useCallback } from 'react';
-import { Calendar, Clock, MapPin, Users, Plus, ChevronLeft, ChevronRight, User, LogOut, X, Cake, Heart, Phone, Mail, Megaphone, Sun, Gift, Upload } from 'lucide-react';
+import { Calendar, Clock, MapPin, Users, Plus, ChevronLeft, ChevronRight, User, LogOut, X, Cake, Heart, Phone, Mail, Megaphone, Sun, Gift, Upload, Paperclip, FileText, Printer, Copy } from 'lucide-react';
 import Papa from 'papaparse';
 
 const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:5000/api';
@@ -120,6 +120,7 @@ const buildMembers = (rows, mapping) =>
       badDate: Boolean((get('birthday') && !birthday) || (get('anniversary') && !anniversary))
     };
   });
+
 // datetime-local inputs need "YYYY-MM-DDTHH:mm" in the viewer's own timezone.
 // toISOString() gives UTC, which was shifting the time, so I subtract the offset first.
 const toLocalInputValue = (iso) => {
@@ -155,6 +156,184 @@ function resizeImageToDataUrl(file, maxSize = 256) {
     reader.readAsDataURL(file);
   });
 }
+
+// ---------- Attachment helpers ----------
+const ATTACHMENT_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'application/pdf'];
+const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024; // same limit as the server
+const MAX_ATTACHMENTS = 5;
+
+const formatSize = (bytes) =>
+  bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+
+// big phone photos get shrunk here so they upload fast and don't eat database space.
+// PDFs and GIFs are left alone (re-encoding a GIF would kill the animation)
+function prepareAttachment(file) {
+  const shrinkable = file.type.startsWith('image/') && file.type !== 'image/gif';
+  if (!shrinkable || file.size <= 1024 * 1024) return Promise.resolve(file);
+
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error(`"${file.name}" could not be read as an image.`));
+    };
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const scale = Math.min(1, 1600 / Math.max(img.width, img.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#ffffff'; // white behind transparent PNGs
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob((blob) => {
+        if (!blob) return reject(new Error(`"${file.name}" could not be processed.`));
+        const newName = file.name.replace(/\.[^.]+$/, '') + '.jpg';
+        resolve(new File([blob], newName, { type: 'image/jpeg' }));
+      }, 'image/jpeg', 0.85);
+    };
+    img.src = url;
+  });
+}
+
+// sends the raw file as the request body (apiFetch only does JSON)
+async function uploadAttachment(announcementId, file, token) {
+  let res;
+  try {
+    res = await fetch(`${API_URL}/announcements/${announcementId}/attachments`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': file.type,
+        'X-Filename': encodeURIComponent(file.name),
+        Authorization: `Bearer ${token}`
+      },
+      body: file
+    });
+  } catch (err) {
+    throw new Error("can't reach the server");
+  }
+  if (!res.ok) {
+    let message = `upload failed (${res.status})`;
+    try { message = (await res.json()).message || message; } catch (e) { /* response wasn't JSON */ }
+    throw new Error(message);
+  }
+}
+
+// files need the login token, so a plain <img src> won't work.
+// I download with the token and make a temporary local URL instead
+async function fetchFileBlobUrl(fileId, token) {
+  let res;
+  try {
+    res = await fetch(`${API_URL}/attachments/${fileId}`, { headers: { Authorization: `Bearer ${token}` } });
+  } catch (err) {
+    throw new Error("Can't reach the server.");
+  }
+  if (!res.ok) throw new Error('Could not load that file.');
+  return URL.createObjectURL(await res.blob());
+}
+
+// ---------- Mailing list helpers ----------
+const escapeHtml = (s) =>
+  String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+// "First Last <email>" so the email app shows names.
+// commas and quotes in a name would break the address list, so I strip them out
+const recipientString = (u) => {
+  const label = fullName(u).replace(/["<>,;]/g, '').trim();
+  return label ? `${label} <${u.email}>` : u.email;
+};
+
+// email apps and Gmail choke on really long links, so these are the limits I stay under.
+// ~2000 is the usual safe ceiling for mailto links, and Gmail's was about 4096 in what I read
+const MAILTO_LIMIT = 1900;
+const GMAIL_LIMIT = 4000;
+
+// builds the link with names, falls back to plain addresses if it's too long,
+// and reports if it's STILL too long so the screen can warn about it
+const buildMailLink = (kind, people, useBcc) => {
+  const limit = kind === 'gmail' ? GMAIL_LIMIT : MAILTO_LIMIT;
+  const field = useBcc ? 'bcc' : 'to';
+  const make = (items) => {
+    // literal commas between addresses, each address encoded on its own
+    const list = items.map(encodeURIComponent).join(',');
+    if (kind === 'gmail') return `https://mail.google.com/mail/?view=cm&fs=1&${field}=${list}`;
+    return useBcc ? `mailto:?bcc=${list}` : `mailto:${list}`;
+  };
+
+  const withNames = make(people.map(recipientString));
+  if (withNames.length <= limit) return { url: withNames, namesDropped: false, tooLong: false };
+
+  const plain = make(people.map((u) => u.email));
+  return { url: plain, namesDropped: true, tooLong: plain.length > limit };
+};
+
+// prints through a hidden iframe so there's no popup to get blocked.
+// in the print window just pick "Save as PDF" as the printer to get a PDF
+const printMailingList = (people) => {
+  const rows = people
+    .map((u, i) => `<tr><td class="num">${i + 1}</td><td>${escapeHtml(fullName(u))}</td><td>${escapeHtml(u.email)}</td></tr>`)
+    .join('');
+  const emailLine = escapeHtml(people.map((u) => u.email).join(', '));
+  const today = new Date().toLocaleDateString([], { year: 'numeric', month: 'long', day: 'numeric' });
+
+  const html = `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Mailing List</title>
+<style>
+  body { font-family: Arial, Helvetica, sans-serif; color: #111; margin: 32px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: #555; font-size: 13px; margin-bottom: 20px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #ddd; }
+  th { border-bottom: 2px solid #999; }
+  td.num { color: #888; width: 36px; }
+  .all { margin-top: 24px; font-size: 12px; }
+  .all strong { display: block; margin-bottom: 4px; }
+  .all p { word-break: break-all; margin: 0; }
+  tr { page-break-inside: avoid; }
+</style>
+</head>
+<body>
+  <h1>Mailing List</h1>
+  <div class="sub">${people.length} recipient${people.length === 1 ? '' : 's'} · ${escapeHtml(today)}</div>
+  <table>
+    <thead><tr><th></th><th>Name</th><th>Email</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+  <div class="all"><strong>All addresses (copy and paste)</strong><p>${emailLine}</p></div>
+</body>
+</html>`;
+
+  const frame = document.createElement('iframe');
+  frame.style.position = 'fixed';
+  frame.style.right = '0';
+  frame.style.bottom = '0';
+  frame.style.width = '0';
+  frame.style.height = '0';
+  frame.style.border = '0';
+  document.body.appendChild(frame);
+
+  const cleanup = () => {
+    if (frame.parentNode) frame.parentNode.removeChild(frame);
+  };
+
+  const doc = frame.contentWindow.document;
+  doc.open();
+  doc.write(html);
+  doc.close();
+
+  frame.contentWindow.onafterprint = cleanup;
+  // giving the iframe a moment to lay out before printing, and a backup cleanup in case afterprint never fires
+  setTimeout(() => {
+    frame.contentWindow.focus();
+    frame.contentWindow.print();
+  }, 250);
+  setTimeout(cleanup, 60000);
+};
 
 const inputClass = 'w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none';
 
@@ -203,15 +382,21 @@ function Login({ onSubmit, onForgot }) {
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [slow, setSlow] = useState(false);
 
   const handleLogin = async () => {
     setError('');
+    setSlow(false);
     setLoading(true);
+    // if sign-in takes over 4 seconds the server is probably waking up, so I tell the person
+    const timer = setTimeout(() => setSlow(true), 4000);
     try {
       await onSubmit(email, password);
     } catch (err) {
       setError(err.message);
     } finally {
+      clearTimeout(timer);
+      setSlow(false);
       setLoading(false);
     }
   };
@@ -228,6 +413,7 @@ function Login({ onSubmit, onForgot }) {
         </div>
         <div className="space-y-4">
           {error && <div className="bg-red-50 text-red-600 p-3 rounded-lg text-sm">{error}</div>}
+          {slow && <div className="bg-blue-50 text-blue-700 p-3 rounded-lg text-sm">The server is waking up. The first sign-in after a quiet period can take up to a minute.</div>}
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Email</label>
             <input
@@ -423,7 +609,8 @@ function EventModal({ event, isAdmin, currentUser, saving, error, onClose, onSav
       .sort((a, b) => a.localeCompare(b));
 
   return (
-    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50" onClick={onClose}>
+    // while I'm typing in the form, clicking outside does nothing. when I'm just viewing, it still closes
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50" onClick={editing ? undefined : onClose}>
       <div className="bg-white rounded-lg max-w-lg w-full max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
         <div className="p-6">
           <div className="flex justify-between items-center mb-6">
@@ -582,8 +769,9 @@ function MemberModal({ member, currentUser, saving, error, onClose, onSave, onDe
   };
 
   return (
-    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50" onClick={onClose}>
-      <div className="bg-white rounded-lg max-w-xl w-full max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+    // no click-outside-to-close here so a stray click can't throw away the form
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+      <div className="bg-white rounded-lg max-w-xl w-full max-h-[90vh] overflow-y-auto">
         <div className="p-6">
           <div className="flex justify-between items-center mb-6">
             <h2 className="text-xl font-bold text-gray-800">{isNew ? 'Add Member' : 'Edit Member'}</h2>
@@ -716,6 +904,96 @@ function MemberModal({ member, currentUser, saving, error, onClose, onSave, onDe
   );
 }
 
+// ---------- Attachment display ----------
+function ImageAttachment({ file, token }) {
+  const [src, setSrc] = useState('');
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let url = '';
+    let cancelled = false;
+    fetchFileBlobUrl(file._id, token)
+      .then((u) => {
+        if (cancelled) URL.revokeObjectURL(u);
+        else { url = u; setSrc(u); }
+      })
+      .catch(() => { if (!cancelled) setFailed(true); });
+    return () => {
+      cancelled = true;
+      if (url) URL.revokeObjectURL(url);
+    };
+  }, [file._id, token]);
+
+  if (failed) return <div className="text-xs text-red-600">Couldn't load {file.filename}</div>;
+  if (!src) return <div className="w-32 h-24 rounded-lg bg-gray-100 animate-pulse" />;
+  return (
+    <a href={src} target="_blank" rel="noreferrer" title={file.filename}>
+      <img src={src} alt={file.filename} className="max-h-56 max-w-full rounded-lg border border-gray-200" />
+    </a>
+  );
+}
+
+function PdfAttachment({ file, token }) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const openPdf = async () => {
+    setError('');
+    // opening the tab right away, before the download, so popup blockers don't stop it
+    const tab = window.open('', '_blank');
+    if (!tab) {
+      setError('Your browser blocked the new tab. Allow pop-ups for this site and try again.');
+      return;
+    }
+    setLoading(true);
+    try {
+      const url = await fetchFileBlobUrl(file._id, token);
+      tab.location.href = url;
+      setTimeout(() => URL.revokeObjectURL(url), 10 * 60 * 1000);
+    } catch (err) {
+      tab.close();
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div>
+      <button
+        onClick={openPdf}
+        disabled={loading}
+        className="inline-flex items-center gap-2 px-3 py-2 border border-gray-200 rounded-lg text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-60"
+      >
+        <FileText className="w-4 h-4 text-red-500 flex-shrink-0" />
+        <span className="truncate max-w-[16rem]">{file.filename}</span>
+        <span className="text-gray-400">{formatSize(file.size)}</span>
+      </button>
+      {error && <p className="text-xs text-red-600 mt-1">{error}</p>}
+    </div>
+  );
+}
+
+function Attachments({ files, token }) {
+  if (!files || files.length === 0) return null;
+  const images = files.filter((f) => f.contentType.startsWith('image/'));
+  const docs = files.filter((f) => !f.contentType.startsWith('image/'));
+  return (
+    <div className="mt-3 space-y-3">
+      {images.length > 0 && (
+        <div className="flex flex-wrap gap-3">
+          {images.map((f) => <ImageAttachment key={f._id} file={f} token={token} />)}
+        </div>
+      )}
+      {docs.length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          {docs.map((f) => <PdfAttachment key={f._id} file={f} token={token} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ---------- Announcement Modal ----------
 function AnnouncementModal({ announcement, saving, error, onClose, onSave, onDelete }) {
   const isNew = !announcement;
@@ -723,12 +1001,54 @@ function AnnouncementModal({ announcement, saving, error, onClose, onSave, onDel
     title: announcement?.title || '',
     body: announcement?.body || ''
   });
+  const [removedIds, setRemovedIds] = useState([]); // existing files taken off, actually deleted when they hit save
+  const [newFiles, setNewFiles] = useState([]);     // files picked but not uploaded yet
+  const [fileError, setFileError] = useState('');
+  const [processing, setProcessing] = useState(false);
 
-  const canSubmit = fd.title.trim() && fd.body.trim();
+  const keptFiles = (announcement?.attachments || []).filter((f) => !removedIds.includes(f._id));
+  const totalFiles = keptFiles.length + newFiles.length;
+  const atLimit = totalFiles >= MAX_ATTACHMENTS;
+  const canSubmit = fd.title.trim() && fd.body.trim() && !processing;
+
+  const handleFiles = async (e) => {
+    const picked = Array.from(e.target.files || []);
+    e.target.value = ''; // so picking the same file again still works
+    if (picked.length === 0) return;
+
+    setFileError('');
+    setProcessing(true);
+    const accepted = [];
+    let problem = '';
+
+    for (const file of picked) {
+      if (!ATTACHMENT_TYPES.includes(file.type)) {
+        problem = `"${file.name}" isn't a supported type. Use JPG, PNG, GIF, WEBP, or PDF.`;
+        continue;
+      }
+      try {
+        const ready = await prepareAttachment(file);
+        if (ready.size > MAX_ATTACHMENT_BYTES) {
+          problem = `"${file.name}" is over the 5 MB limit.`;
+          continue;
+        }
+        accepted.push(ready);
+      } catch (err) {
+        problem = err.message;
+      }
+    }
+
+    const room = MAX_ATTACHMENTS - totalFiles;
+    if (accepted.length > room) problem = `Only ${MAX_ATTACHMENTS} files fit on one announcement, so I left the extras off.`;
+    setNewFiles((prev) => [...prev, ...accepted.slice(0, Math.max(0, room))]);
+    setFileError(problem);
+    setProcessing(false);
+  };
 
   return (
-    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50" onClick={onClose}>
-      <div className="bg-white rounded-lg max-w-lg w-full max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+    // no click-outside-to-close here so a stray click can't throw away what I typed
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+      <div className="bg-white rounded-lg max-w-lg w-full max-h-[90vh] overflow-y-auto">
         <div className="p-6">
           <div className="flex justify-between items-center mb-6">
             <h2 className="text-xl font-bold text-gray-800">{isNew ? 'New Announcement' : 'Edit Announcement'}</h2>
@@ -744,10 +1064,54 @@ function AnnouncementModal({ announcement, saving, error, onClose, onSave, onDel
             <Field label="Message">
               <textarea value={fd.body} onChange={(e) => setFd({ ...fd, body: e.target.value })} className={`${inputClass} h-32`} />
             </Field>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Attachments</label>
+              {(keptFiles.length > 0 || newFiles.length > 0) && (
+                <ul className="space-y-1 mb-2">
+                  {keptFiles.map((f) => (
+                    <li key={f._id} className="flex items-center justify-between gap-2 text-sm bg-gray-50 rounded-lg px-3 py-2">
+                      <span className="truncate">{f.filename} <span className="text-gray-400">({formatSize(f.size)})</span></span>
+                      <button onClick={() => setRemovedIds([...removedIds, f._id])} title="Remove" className="text-gray-400 hover:text-red-600 flex-shrink-0">
+                        <X className="w-4 h-4" />
+                      </button>
+                    </li>
+                  ))}
+                  {newFiles.map((f, i) => (
+                    <li key={`new-${i}`} className="flex items-center justify-between gap-2 text-sm bg-indigo-50 rounded-lg px-3 py-2">
+                      <span className="truncate">{f.name} <span className="text-gray-400">({formatSize(f.size)}) · new</span></span>
+                      <button onClick={() => setNewFiles(newFiles.filter((_, idx) => idx !== i))} title="Remove" className="text-gray-400 hover:text-red-600 flex-shrink-0">
+                        <X className="w-4 h-4" />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <label
+                htmlFor="attachment-upload"
+                className={`inline-flex items-center gap-2 px-3 py-2 border border-gray-300 rounded-lg text-sm ${atLimit || processing ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer hover:bg-gray-50'
+                  }`}
+              >
+                <Paperclip className="w-4 h-4" />
+                {processing ? 'Preparing…' : 'Add images or PDFs'}
+              </label>
+              <input
+                id="attachment-upload"
+                type="file"
+                multiple
+                accept="image/jpeg,image/png,image/gif,image/webp,application/pdf"
+                onChange={handleFiles}
+                disabled={atLimit || processing}
+                className="hidden"
+              />
+              {fileError && <p className="text-xs text-red-600 mt-1">{fileError}</p>}
+              <p className="text-xs text-gray-400 mt-1">Up to 5 files, 5 MB each. Big photos are shrunk automatically.</p>
+            </div>
+
             <div className="flex gap-3 pt-2">
               <button
                 disabled={!canSubmit || saving}
-                onClick={() => onSave({ ...fd, id: announcement?.id })}
+                onClick={() => onSave({ ...fd, id: announcement?.id, newFiles, removedIds })}
                 className="flex-1 bg-indigo-600 text-white py-2 rounded-lg hover:bg-indigo-700 font-medium disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 {saving ? 'Saving…' : isNew ? 'Post Announcement' : 'Save Changes'}
@@ -769,7 +1133,6 @@ function AnnouncementModal({ announcement, saving, error, onClose, onSave, onDel
   );
 }
 
-// ---------- Calendar ----------
 // ---------- Import Modal ----------
 function ImportModal({ onClose, onImport }) {
   const [stage, setStage] = useState('pick'); // 'pick' | 'review' | 'done'
@@ -822,8 +1185,9 @@ function ImportModal({ onClose, onImport }) {
   };
 
   return (
-    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50" onClick={onClose}>
-      <div className="bg-white rounded-lg max-w-2xl w-full max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+    // no click-outside-to-close so I can't lose my column choices by accident
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+      <div className="bg-white rounded-lg max-w-2xl w-full max-h-[90vh] overflow-y-auto">
         <div className="p-6">
           <div className="flex justify-between items-center mb-6">
             <h2 className="text-xl font-bold text-gray-800">Import Members from CSV</h2>
@@ -936,6 +1300,170 @@ function ImportModal({ onClose, onImport }) {
     </div>
   );
 }
+
+// ---------- Mailing List Modal ----------
+function MailingListModal({ users, onClose }) {
+  const sorted = [...users].sort(byLastName);
+  // everybody starts checked and I can uncheck anyone who shouldn't get the email
+  const [selectedIds, setSelectedIds] = useState(() => new Set(users.map((u) => u.id)));
+  const [useBcc, setUseBcc] = useState(true);
+  const [separator, setSeparator] = useState(', ');
+  const [note, setNote] = useState('');
+  const [manualText, setManualText] = useState('');
+
+  const chosen = sorted.filter((u) => selectedIds.has(u.id));
+  const mailtoInfo = buildMailLink('mailto', chosen, useBcc);
+  const gmailInfo = buildMailLink('gmail', chosen, useBcc);
+  const plural = chosen.length === 1 ? '' : 'es';
+
+  const toggle = (id) => {
+    const next = new Set(selectedIds);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    setSelectedIds(next);
+    setNote('');
+    setManualText('');
+  };
+
+  const selectAll = () => { setSelectedIds(new Set(users.map((u) => u.id))); setNote(''); setManualText(''); };
+  const selectNone = () => { setSelectedIds(new Set()); setNote(''); setManualText(''); };
+
+  const openEmailApp = () => {
+    setNote('If nothing opened, this computer may not have a default email app set up. Try the Gmail button or Copy instead.');
+    window.location.href = mailtoInfo.url;
+  };
+
+  const openGmail = () => {
+    window.open(gmailInfo.url, '_blank', 'noopener');
+  };
+
+  const copyEmails = async () => {
+    const text = chosen.map((u) => u.email).join(separator);
+    try {
+      await navigator.clipboard.writeText(text);
+      setManualText('');
+      setNote(`Copied ${chosen.length} address${plural}. Paste them into the ${useBcc ? 'BCC' : 'To'} field of your email.`);
+    } catch (err) {
+      // some browsers block automatic copying, so I show the text to copy by hand
+      setManualText(text);
+      setNote("Your browser wouldn't let me copy automatically. Select the addresses below and copy them yourself.");
+    }
+  };
+
+  let linkNotice = '';
+  if (chosen.length > 0) {
+    if (mailtoInfo.tooLong && gmailInfo.tooLong) {
+      linkNotice = "This list is too long to open in an email directly. Use Copy and paste the addresses into your email, or uncheck some people.";
+    } else if (mailtoInfo.tooLong) {
+      linkNotice = "This list is too long for the email app button, but the Gmail button and Copy will still work.";
+    } else if (mailtoInfo.namesDropped) {
+      linkNotice = "The list is long, so the email app button uses addresses only (no names) to keep the link short.";
+    }
+  }
+
+  return (
+    // no click-outside-to-close so my checkbox choices don't disappear
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+      <div className="bg-white rounded-lg max-w-2xl w-full max-h-[90vh] overflow-y-auto">
+        <div className="p-6">
+          <div className="flex justify-between items-center mb-4">
+            <h2 className="text-xl font-bold text-gray-800">Mailing List</h2>
+            <button onClick={onClose} className="text-gray-400 hover:text-gray-600"><X className="w-5 h-5" /></button>
+          </div>
+
+          {users.length === 0 ? (
+            <p className="text-sm text-gray-500">There are no members yet.</p>
+          ) : (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-gray-600">{chosen.length} of {users.length} selected</span>
+                <span className="space-x-3">
+                  <button onClick={selectAll} className="text-indigo-600 hover:underline">Select all</button>
+                  <button onClick={selectNone} className="text-indigo-600 hover:underline">Select none</button>
+                </span>
+              </div>
+
+              <div className="border border-gray-200 rounded-lg max-h-64 overflow-y-auto divide-y">
+                {sorted.map((u) => (
+                  <label key={u.id} className="flex items-center gap-3 px-3 py-2 text-sm cursor-pointer hover:bg-gray-50">
+                    <input type="checkbox" checked={selectedIds.has(u.id)} onChange={() => toggle(u.id)} />
+                    <span className="font-medium text-gray-800">{fullName(u)}</span>
+                    <span className="text-gray-500 truncate">{u.email}</span>
+                  </label>
+                ))}
+              </div>
+
+              <div className="space-y-2 text-sm">
+                <label className="flex items-start gap-2 cursor-pointer">
+                  <input type="checkbox" checked={useBcc} onChange={(e) => setUseBcc(e.target.checked)} className="mt-1" />
+                  <span>
+                    Put everyone in BCC
+                    <span className="block text-xs text-gray-400">Recommended. Recipients won't see each other's addresses. Turn off to use the To field.</span>
+                  </span>
+                </label>
+                <label className="flex items-center gap-2">
+                  <span className="text-gray-600">When copying, separate addresses with</span>
+                  <select value={separator} onChange={(e) => setSeparator(e.target.value)} className="px-2 py-1 border border-gray-300 rounded-lg text-sm">
+                    <option value=", ">commas (Gmail and most apps)</option>
+                    <option value="; ">semicolons (some Outlook setups)</option>
+                  </select>
+                </label>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <button
+                  onClick={openEmailApp}
+                  disabled={chosen.length === 0 || mailtoInfo.tooLong}
+                  className="flex items-center justify-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <Mail className="w-4 h-4" /> Open in email app
+                </button>
+                <button
+                  onClick={openGmail}
+                  disabled={chosen.length === 0 || gmailInfo.tooLong}
+                  className="flex items-center justify-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <Mail className="w-4 h-4" /> Open in Gmail
+                </button>
+                <button
+                  onClick={copyEmails}
+                  disabled={chosen.length === 0}
+                  className="flex items-center justify-center gap-2 px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <Copy className="w-4 h-4" /> Copy emails
+                </button>
+                <button
+                  onClick={() => printMailingList(chosen)}
+                  disabled={chosen.length === 0}
+                  className="flex items-center justify-center gap-2 px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <Printer className="w-4 h-4" /> Print / Save as PDF
+                </button>
+              </div>
+
+              {linkNotice && <p className="text-xs text-amber-600">{linkNotice}</p>}
+              {note && <p className="text-xs text-gray-600">{note}</p>}
+              {manualText && (
+                <textarea
+                  readOnly
+                  value={manualText}
+                  onFocus={(e) => e.target.select()}
+                  className={`${inputClass} h-24 text-xs`}
+                />
+              )}
+            </div>
+          )}
+
+          <button onClick={onClose} className="w-full mt-5 border border-gray-300 py-2 rounded-lg hover:bg-gray-50 font-medium">
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Calendar ----------
 function MonthCalendar({ viewDate, events, onEventClick }) {
   const year = viewDate.getFullYear();
   const month = viewDate.getMonth();
@@ -1002,12 +1530,13 @@ function Dashboard({ currentUser, token, onLogout }) {
   const [showEventModal, setShowEventModal] = useState(false);
   const [showMemberModal, setShowMemberModal] = useState(false);
   const [showAnnouncementModal, setShowAnnouncementModal] = useState(false);
+  const [showImportModal, setShowImportModal] = useState(false);
+  const [showMailingModal, setShowMailingModal] = useState(false);
   const [selectedEvent, setSelectedEvent] = useState(null);
   const [selectedMember, setSelectedMember] = useState(null);
   const [selectedAnnouncement, setSelectedAnnouncement] = useState(null);
   const [modalError, setModalError] = useState('');
   const [saving, setSaving] = useState(false);
-  const [showImportModal, setShowImportModal] = useState(false);
 
   const isAdmin = currentUser.role === 'admin';
 
@@ -1147,11 +1676,13 @@ function Dashboard({ currentUser, token, onLogout }) {
       setSaving(false);
     }
   };
+
   const importMembers = async (members) => {
     const data = await apiFetch('/users/import', { method: 'POST', token, body: { members } });
     await loadUsers();
     return data;
   };
+
   const deleteMember = async (id) => {
     if (!window.confirm('Delete this member? This cannot be undone.')) return;
     setSaving(true);
@@ -1177,13 +1708,37 @@ function Dashboard({ currentUser, token, onLogout }) {
     setModalError('');
     try {
       const body = { title: data.title, body: data.body };
+      let announcementId = data.id;
       if (data.id) {
         await apiFetch(`/announcements/${data.id}`, { method: 'PUT', token, body });
       } else {
-        await apiFetch('/announcements', { method: 'POST', token, body });
+        const created = await apiFetch('/announcements', { method: 'POST', token, body });
+        announcementId = created._id;
       }
+
+      // file problems get collected instead of stopping everything, otherwise a retry
+      // could post the same announcement twice
+      const problems = [];
+      for (const attId of data.removedIds || []) {
+        try {
+          await apiFetch(`/announcements/${announcementId}/attachments/${attId}`, { method: 'DELETE', token });
+        } catch (err) {
+          problems.push(`a file couldn't be removed (${err.message})`);
+        }
+      }
+      for (const file of data.newFiles || []) {
+        try {
+          await uploadAttachment(announcementId, file, token);
+        } catch (err) {
+          problems.push(`${file.name} didn't upload (${err.message})`);
+        }
+      }
+
       await loadAnnouncements();
       closeAnnouncementModal();
+      if (problems.length) {
+        setLoadError(`The announcement was saved, but ${problems.join('; ')}. Edit it to try again.`);
+      }
     } catch (err) {
       setModalError(err.message);
     } finally {
@@ -1300,6 +1855,7 @@ function Dashboard({ currentUser, token, onLogout }) {
                       )}
                     </div>
                     <p className="text-gray-700 mt-2 whitespace-pre-wrap">{a.body}</p>
+                    <Attachments files={a.attachments} token={token} />
                   </div>
                 ))}
               </div>
@@ -1309,12 +1865,15 @@ function Dashboard({ currentUser, token, onLogout }) {
 
         {tab === 'members' && (
           <div className="bg-white rounded-xl shadow-sm p-6">
-            <div className="flex justify-between items-center mb-6">
+            <div className="flex flex-wrap justify-between items-center gap-3 mb-6">
               <h2 className="text-lg font-semibold text-gray-800">
                 Members <span className="text-gray-400 font-normal text-sm">({users.length})</span>
               </h2>
               {isAdmin && (
-                <div className="flex gap-2">
+                <div className="flex flex-wrap gap-2">
+                  <button onClick={() => setShowMailingModal(true)} className="flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 text-sm font-medium">
+                    <Mail className="w-4 h-4" /> Mailing List
+                  </button>
                   <button onClick={() => setShowImportModal(true)} className="flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 text-sm font-medium">
                     <Upload className="w-4 h-4" /> Import CSV
                   </button>
@@ -1399,8 +1958,13 @@ function Dashboard({ currentUser, token, onLogout }) {
           onDelete={deleteAnnouncement}
         />
       )}
-            {showImportModal && (
+
+      {showImportModal && (
         <ImportModal onClose={() => setShowImportModal(false)} onImport={importMembers} />
+      )}
+
+      {showMailingModal && (
+        <MailingListModal users={users} onClose={() => setShowMailingModal(false)} />
       )}
     </div>
   );
@@ -1420,6 +1984,11 @@ export default function App() {
       setResetToken(t);
       setView('reset');
     }
+  }, []);
+
+  // pinging the backend as soon as the site loads so it starts waking up while the person types their login
+  useEffect(() => {
+    fetch(`${API_URL}/health`).catch(() => {});
   }, []);
 
   const login = async (email, password) => {
