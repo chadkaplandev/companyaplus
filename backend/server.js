@@ -56,9 +56,10 @@ const announcementSchema = new mongoose.Schema({
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
 }, { timestamps: true });
 
-// files live in their own collection so the announcement list stays small and fast
+// kind 'inline' = a picture placed inside an announcement's text, 'attachment' = a file listed at the bottom
 const attachmentSchema = new mongoose.Schema({
-  announcement: { type: mongoose.Schema.Types.ObjectId, ref: 'Announcement', required: true, index: true },
+  announcement: { type: mongoose.Schema.Types.ObjectId, ref: 'Announcement', default: null, index: true },
+  kind: { type: String, enum: ['attachment', 'inline'], default: 'attachment' },
   filename: { type: String, required: true },
   contentType: { type: String, required: true },
   size: { type: Number, required: true },
@@ -73,6 +74,7 @@ const Attachment = mongoose.model('Attachment', attachmentSchema);
 const ALLOWED_ATTACHMENT_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'application/pdf'];
 const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024; // 5 MB per file
 const MAX_ATTACHMENTS_PER_ANNOUNCEMENT = 5;
+const INLINE_IMAGE_TYPES = ALLOWED_ATTACHMENT_TYPES.filter((t) => t !== 'application/pdf');
 
 // ---------- Helpers ----------
 const sanitizeUser = (userDoc) => {
@@ -98,6 +100,61 @@ const cleanPicture = (pic) => {
   if (!pic) return '';
   if (typeof pic !== 'string' || !pic.startsWith('data:image/') || pic.length > 300000) return null;
   return pic;
+};
+
+// ---------- Phone numbers ----------
+const PHONE_FIELDS = ['phoneCell', 'phoneHome', 'phoneSummer'];
+const PHONE_LABELS = { phoneCell: 'Cell phone', phoneHome: 'Home phone', phoneSummer: 'Summer phone' };
+
+// any 10 digits become (123)456-7890. '' means no number, null means it wasn't a full 10-digit number
+const formatPhone = (raw) => {
+  let digits = String(raw || '').replace(/\D/g, '');
+  if (digits.length === 11 && digits[0] === '1') digits = digits.slice(1);
+  if (digits.length === 0) return '';
+  if (digits.length !== 10) return null;
+  return `(${digits.slice(0, 3)})${digits.slice(3, 6)}-${digits.slice(6)}`;
+};
+
+const cleanPhones = (body) => {
+  const values = {};
+  for (const f of PHONE_FIELDS) {
+    if (body[f] === undefined) continue;
+    const formatted = formatPhone(body[f]);
+    if (formatted === null) return { error: `${PHONE_LABELS[f]} needs all 10 digits, like (123)456-7890` };
+    values[f] = formatted;
+  }
+  return { values };
+};
+
+// ---------- Announcement helpers ----------
+const checkAnnouncementBody = (title, body) => {
+  if (!title || !String(title).trim()) return 'A title is required';
+  if (typeof body !== 'string') return 'The message is required';
+  const hasText = body.replace(/<[^>]*>/g, '').replace(/&nbsp;/g, ' ').trim().length > 0;
+  if (!hasText && !/data-image-id=/.test(body)) return 'The message is required';
+  if (body.length > 100000) return 'That announcement is too long';
+  return '';
+};
+
+// pulls the picture ids out of the announcement's HTML
+const imageIdsInBody = (html) => {
+  const ids = new Set();
+  const re = /data-image-id="([a-f0-9]{24})"/gi;
+  let m;
+  while ((m = re.exec(html || '')) !== null) ids.add(m[1]);
+  return [...ids];
+};
+
+// claims the pictures this announcement uses and deletes the ones it dropped
+const syncInlineImages = async (announcementId, html) => {
+  const ids = imageIdsInBody(html);
+  if (ids.length) {
+    await Attachment.updateMany(
+      { _id: { $in: ids }, kind: 'inline', $or: [{ announcement: null }, { announcement: announcementId }] },
+      { $set: { announcement: announcementId } }
+    );
+  }
+  await Attachment.deleteMany({ announcement: announcementId, kind: 'inline', _id: { $nin: ids } });
 };
 
 // looks up the names of everyone who RSVP'd so members can see them without needing the full member list
@@ -128,7 +185,7 @@ const eventToJson = async (eventDoc) => sanitizeEvent(eventDoc, await loadNamesF
 // tacks a list of file info (never the file data itself) onto each announcement
 const withAttachments = async (announcements) => {
   const ids = announcements.map((a) => a._id);
-  const files = await Attachment.find({ announcement: { $in: ids } })
+  const files = await Attachment.find({ announcement: { $in: ids }, kind: { $ne: 'inline' } })
     .select('announcement filename contentType size')
     .sort({ createdAt: 1 });
 
@@ -343,12 +400,9 @@ app.post('/api/auth/reset-password', async (req, res) => {
 // ---------- Bulk import (admin only) ----------
 app.post('/api/users/import', authenticate, requireAdmin, async (req, res) => {
   try {
-    const { members } = req.body;
-    if (!Array.isArray(members) || members.length === 0) {
-      return res.status(400).json({ message: 'There are no members to import' });
-    }
-    if (members.length > 300) {
-      return res.status(400).json({ message: 'Please import 300 members or fewer at a time' });
+    const members = Array.isArray(req.body.members) ? req.body.members : req.body;
+    if (!Array.isArray(members)) {
+      return res.status(400).json({ message: 'Expected an array of members' });
     }
 
     // grabbing the emails that already exist so I can skip them instead of failing the whole import
@@ -385,6 +439,13 @@ app.post('/api/users/import', authenticate, requireAdmin, async (req, res) => {
         skipped.push({ row, who, reason: 'Listed more than once in the file' });
         continue;
       }
+
+      const phones = cleanPhones(m);
+      if (phones.error) {
+        failed.push({ row, who, reason: phones.error });
+        continue;
+      }
+
       seenInFile.add(email);
 
       try {
@@ -397,7 +458,8 @@ app.post('/api/users/import', authenticate, requireAdmin, async (req, res) => {
           email,
           password: hashed,
           role: 'member',
-          ...pickProfileFields(m)
+          ...pickProfileFields(m),
+          ...phones.values
         });
         created++;
       } catch (err) {
@@ -432,6 +494,9 @@ app.post('/api/users', authenticate, requireAdmin, async (req, res) => {
     const picture = cleanPicture(profilePicture);
     if (picture === null) return res.status(400).json({ message: 'Profile picture must be a small image file' });
 
+    const phones = cleanPhones(req.body);
+    if (phones.error) return res.status(400).json({ message: phones.error });
+
     const hashed = await bcrypt.hash(password, 10);
     const user = await User.create({
       firstName,
@@ -440,6 +505,7 @@ app.post('/api/users', authenticate, requireAdmin, async (req, res) => {
       password: hashed,
       profilePicture: picture,
       ...pickProfileFields(req.body),
+      ...phones.values,
       role: role === 'admin' ? 'admin' : 'member'
     });
 
@@ -463,7 +529,10 @@ app.put('/api/users/:id', authenticate, requireAdmin, async (req, res) => {
       return res.status(400).json({ message: "You can't remove your own admin access" });
     }
 
-    const update = { firstName, lastName, email, role: newRole, ...pickProfileFields(req.body) };
+    const phones = cleanPhones(req.body);
+    if (phones.error) return res.status(400).json({ message: phones.error });
+
+    const update = { firstName, lastName, email, role: newRole, ...pickProfileFields(req.body), ...phones.values };
 
     if (profilePicture !== undefined) {
       const picture = cleanPicture(profilePicture);
@@ -586,8 +655,11 @@ app.get('/api/announcements', authenticate, async (req, res) => {
 app.post('/api/announcements', authenticate, requireAdmin, async (req, res) => {
   try {
     const { title, body } = req.body;
-    if (!title || !body) return res.status(400).json({ message: 'title and body are required' });
-    const announcement = await Announcement.create({ title, body, createdBy: req.userId });
+    const problem = checkAnnouncementBody(title, body);
+    if (problem) return res.status(400).json({ message: problem });
+
+    const announcement = await Announcement.create({ title: title.trim(), body, createdBy: req.userId });
+    await syncInlineImages(announcement._id, body);
     await announcement.populate('createdBy', 'firstName lastName');
     res.status(201).json(announcement);
   } catch (err) {
@@ -598,12 +670,17 @@ app.post('/api/announcements', authenticate, requireAdmin, async (req, res) => {
 app.put('/api/announcements/:id', authenticate, requireAdmin, async (req, res) => {
   try {
     const { title, body } = req.body;
+    const problem = checkAnnouncementBody(title, body);
+    if (problem) return res.status(400).json({ message: problem });
+
     const announcement = await Announcement.findByIdAndUpdate(
       req.params.id,
-      { title, body },
+      { title: title.trim(), body },
       { new: true, runValidators: true }
     ).populate('createdBy', 'firstName lastName');
     if (!announcement) return res.status(404).json({ message: 'Announcement not found' });
+
+    await syncInlineImages(announcement._id, body);
     res.json(announcement);
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
@@ -642,7 +719,7 @@ app.post(
       const announcement = await Announcement.findById(req.params.id);
       if (!announcement) return res.status(404).json({ message: 'Announcement not found' });
 
-      const count = await Attachment.countDocuments({ announcement: announcement._id });
+      const count = await Attachment.countDocuments({ announcement: announcement._id, kind: { $ne: 'inline' } });
       if (count >= MAX_ATTACHMENTS_PER_ANNOUNCEMENT) {
         return res.status(400).json({ message: `An announcement can have up to ${MAX_ATTACHMENTS_PER_ANNOUNCEMENT} attachments` });
       }
@@ -695,6 +772,48 @@ app.delete('/api/announcements/:id/attachments/:attachmentId', authenticate, req
     res.status(500).json({ message: 'Server error', error: err.message });
   }
 });
+
+// pictures placed inside an announcement's text. they start with no announcement and get claimed when it's saved
+app.post(
+  '/api/images',
+  authenticate,
+  requireAdmin,
+  express.raw({ type: INLINE_IMAGE_TYPES, limit: MAX_ATTACHMENT_BYTES }),
+  async (req, res) => {
+    try {
+      const contentType = (req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+      if (!INLINE_IMAGE_TYPES.includes(contentType)) {
+        return res.status(400).json({ message: 'Only JPG, PNG, GIF, or WEBP images can go inside an announcement' });
+      }
+      if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+        return res.status(400).json({ message: 'That file was empty' });
+      }
+
+      // sweeping out pictures that were uploaded but never used in a saved announcement
+      await Attachment.deleteMany({
+        kind: 'inline',
+        announcement: null,
+        createdAt: { $lt: new Date(Date.now() - 24 * 60 * 60 * 1000) }
+      });
+
+      let filename = 'image';
+      try { filename = decodeURIComponent(req.headers['x-filename'] || '') || filename; } catch (e) { /* keep the default */ }
+      filename = filename.replace(/[\\/\r\n"]/g, '_').slice(0, 150);
+
+      const file = await Attachment.create({
+        kind: 'inline',
+        announcement: null,
+        filename,
+        contentType,
+        size: req.body.length,
+        data: req.body
+      });
+      res.status(201).json({ _id: file._id });
+    } catch (err) {
+      res.status(500).json({ message: 'Server error', error: err.message });
+    }
+  }
+);
 
 // ---------- Health check ----------
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));

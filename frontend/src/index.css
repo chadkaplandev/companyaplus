@@ -1,3 +1,25 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* announcement text (shared by the editor and the display) */
+.rich-content { line-height: 1.6; color: #1f2937; overflow-wrap: anywhere; }
+.rich-content > * + * { margin-top: 0.75rem; }
+.rich-content h1 { font-size: 1.6rem; font-weight: 700; line-height: 1.25; }
+.rich-content h2 { font-size: 1.3rem; font-weight: 700; line-height: 1.3; }
+.rich-content h3 { font-size: 1.1rem; font-weight: 600; }
+.rich-content ul { list-style: disc; padding-left: 1.5rem; }
+.rich-content ol { list-style: decimal; padding-left: 1.5rem; }
+.rich-content li > p { margin: 0; }
+.rich-content blockquote { border-left: 3px solid #c7d2fe; padding-left: 1rem; color: #4b5563; }
+.rich-content a { color: #4f46e5; text-decoration: underline; }
+.rich-content mark { border-radius: 0.2rem; padding: 0 0.1rem; }
+.rich-content img { display: block; max-width: 100%; height: auto; border-radius: 0.5rem; margin: 0.75rem auto; }
+.rich-content img[data-align="left"] { margin-left: 0; margin-right: auto; }
+.rich-content img[data-align="right"] { margin-left: auto; margin-right: 0; }
+.rich-content img[data-width="25%"] { width: 25%; }
+.rich-content img[data-width="50%"] { width: 50%; }
+.rich-content img[data-width="75%"] { width: 75%; }
+.rich-content img[data-width="100%"] { width: 100%; }
+.rich-view img { cursor: zoom-in; }
+.rich-view img:not([src]) { min-height: 6rem; background: #f3f4f6; }
