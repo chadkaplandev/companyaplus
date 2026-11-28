@@ -37,7 +37,9 @@ const userSchema = new mongoose.Schema({
   phoneSummer: { type: String, default: '' },
   role: { type: String, enum: ['admin', 'member'], default: 'member' },
   resetTokenHash: { type: String, default: null },
-  resetTokenExpires: { type: Date, default: null }
+  resetTokenExpires: { type: Date, default: null },
+  lastLoginAt: { type: Date, default: null }
+
 }, { timestamps: true });
 
 const eventSchema = new mongoose.Schema({
@@ -331,6 +333,8 @@ app.post('/api/auth/login', async (req, res) => {
     const match = await bcrypt.compare(password, user.password);
     if (!match) return res.status(400).json({ message: 'Invalid email or password' });
 
+        // remembering when they signed in. updateOne skips validation so older accounts can't trip on it
+    await User.updateOne({ _id: user._id }, { $set: { lastLoginAt: new Date() } });
     const token = jwt.sign({ id: user._id, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
     res.json({ token, user: sanitizeUser(user) });
   } catch (err) {
@@ -478,7 +482,10 @@ app.post('/api/users/import', authenticate, requireAdmin, async (req, res) => {
 app.get('/api/users', authenticate, async (req, res) => {
   try {
     const users = await User.find().sort({ lastName: 1, firstName: 1 });
-    res.json(users.map(sanitizeUser));
+    const list = users.map(sanitizeUser);
+    // login activity is for admins only, so members never get that field
+    if (req.userRole !== 'admin') list.forEach((u) => { delete u.lastLoginAt; });
+    res.json(list);
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
   }

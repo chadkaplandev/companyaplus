@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Calendar, MapPin, Plus, ChevronLeft, ChevronRight, User, LogOut, Cake, Heart, Phone, Mail, Megaphone, Sun, Gift, Upload, Search, X } from 'lucide-react';
+import { Calendar, MapPin, Plus, ChevronLeft, ChevronRight, User, LogOut, Cake, Heart, Phone, Mail, Megaphone, Sun, Gift, Upload, Search, X, Clock } from 'lucide-react';
 import { apiFetch } from './api';
 import {
   byLastName,
@@ -37,7 +37,7 @@ export default function Dashboard({ currentUser, token, onLogout }) {
   const [modalError, setModalError] = useState('');
   const [saving, setSaving] = useState(false);
   const [memberSearch, setMemberSearch] = useState('');
-
+  const [loginFilter, setLoginFilter] = useState('all');
   const isAdmin = currentUser.role === 'admin';
 
   const loadEvents = useCallback(async () => {
@@ -263,11 +263,13 @@ export default function Dashboard({ currentUser, token, onLogout }) {
 
   // every word typed has to appear in the member's name, so "smith jo" and "jo smith" both find Jo Smith
   const searchWords = memberSearch.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const neverCount = users.filter((u) => !u.lastLoginAt).length;
   const visibleMembers = [...users]
     .filter((u) => {
       const name = `${u.firstName || ''} ${u.lastName || ''}`.toLowerCase();
       return searchWords.every((w) => name.includes(w));
     })
+    .filter((u) => loginFilter !== 'never' || !u.lastLoginAt)
     .sort(byLastName);
 
   return (
@@ -408,7 +410,23 @@ export default function Dashboard({ currentUser, token, onLogout }) {
                 </button>
               )}
             </div>
-            {searchWords.length > 0 && (
+            {isAdmin && (
+              <div className="flex gap-2 mb-4 text-sm">
+                <button
+                  onClick={() => setLoginFilter('all')}
+                  className={`px-3 py-1 rounded-full border ${loginFilter === 'all' ? 'bg-indigo-600 text-white border-indigo-600' : 'border-gray-300 text-gray-700 hover:bg-gray-50'}`}
+                >
+                  All members
+                </button>
+                <button
+                  onClick={() => setLoginFilter('never')}
+                  className={`px-3 py-1 rounded-full border ${loginFilter === 'never' ? 'bg-indigo-600 text-white border-indigo-600' : 'border-gray-300 text-gray-700 hover:bg-gray-50'}`}
+                >
+                  Haven't logged in ({neverCount})
+                </button>
+              </div>
+            )}
+            {(searchWords.length > 0 || loginFilter === 'never') && (
               <p className="text-xs text-gray-500 mb-3">Showing {visibleMembers.length} of {users.length} members</p>
             )}
             {visibleMembers.length === 0 && users.length > 0 && (
@@ -444,6 +462,9 @@ export default function Dashboard({ currentUser, token, onLogout }) {
                       {u.anniversary && <Detail icon={Gift} label="Anniversary">{formatMonthDay(u.anniversary)}</Detail>}
                       {u.address && <Detail icon={MapPin} label="Address">{u.address}</Detail>}
                       {u.summerAddress && <Detail icon={Sun} label="Summer address">{u.summerAddress}</Detail>}
+                      {isAdmin && (u.lastLoginAt
+                        ? <Detail icon={Clock} label="Last login">{new Date(u.lastLoginAt).toLocaleString([], { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}</Detail>
+                        : <Detail icon={Clock}><span className="text-amber-600">Hasn't logged in yet</span></Detail>)}
                     </div>
                   </div>
                 </div>
